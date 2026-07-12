@@ -373,15 +373,28 @@ optional<vector<VarMap>> translate_strips_conditions_aux(
     return expand_condition_map(condition);
 }
 
+// Satisfiability part of translate_strips_conditions_aux without the DNF
+// expansion. The aux function returns nullopt exactly when one of the two
+// add_*_conditions steps fails (the expansion always yields at least one
+// assignment), so this decides nullopt-ness without materializing the
+// discarded expansion -- the mutex-encoding check below only needs the
+// verdict, and the expansion was pure allocation churn on every operator.
+bool strips_conditions_satisfiable(
+    const vector<GroundLiteral> &conditions, const FactToVarVals &factvals,
+    const vector<int> &ranges) {
+    CondMap condition;
+    return add_positive_conditions(conditions, factvals, condition) &&
+           add_negative_conditions(conditions, factvals, ranges, condition);
+}
+
 optional<vector<VarMap>> translate_strips_conditions(
     const vector<GroundLiteral> &conditions, const FactToVarVals &factvals,
     const vector<int> &ranges, const FactToVarVals &mutex_factvals,
     const vector<int> &mutex_ranges) {
     if (conditions.empty())
         return vector<VarMap>{{}};
-    auto mtx = translate_strips_conditions_aux(
-        conditions, mutex_factvals, mutex_ranges);
-    if (!mtx)
+    if (!strips_conditions_satisfiable(
+            conditions, mutex_factvals, mutex_ranges))
         return nullopt;
     return translate_strips_conditions_aux(conditions, factvals, ranges);
 }
