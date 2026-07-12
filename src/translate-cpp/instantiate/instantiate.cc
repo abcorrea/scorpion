@@ -237,6 +237,259 @@ long long resolve_action_cost(
     return evaluate_constant(*it->second);
 }
 
+/*
+  Compiled form of an action schema. Instantiating a schema for every ground
+  action re-walks its condition tree (a virtual call per node) and resolves
+  every argument name through a string lookup in VarMapping -- all of which
+  is invariant across the schema's ground actions. Compilation resolves each
+  literal once into an integer predicate id plus per-arg codes (>= 0:
+  interned constant id; < 0: ~code = slot in the parameter-value array), so
+  binding a ground action just copies interned ids from the model atom into
+  the slots and probes the fact map.
+
+  Schemas whose conditions use shapes the compiler does not handle
+  (disjunctions, universals, falsity) keep `usable == false` and fall back
+  to the original tree walk.
+*/
+struct CompiledLiteral {
+    int predicate;
+    bool negated;
+    small_vector::SmallVector<int, 4> args; // >= 0: const id; < 0: ~slot
+};
+
+struct CompiledEffect {
+    // Object-id domains for the effect's own parameters (their slots follow
+    // the action's), resolved from objects_by_type once. An effect whose
+    // parameter type has no objects can never fire.
+    vector<const vector<int> *> param_domains;
+    bool dead = false;
+    vector<CompiledLiteral> condition;
+    CompiledLiteral literal;
+};
+
+struct CompiledAction {
+    bool usable = false;
+    vector<CompiledLiteral> precondition;
+    vector<CompiledEffect> effects;
+    size_t num_slots = 0;
+};
+
+/*
+  Resolve an argument name to its parameter slot, mirroring VarMapping's
+  one-entry-per-name update semantics: effect parameters shadow action
+  parameters of the same name, and among same-named parameters the last
+  binding wins. Names bound to no parameter are treated as constants and
+  interned (exactly what the string path's failed map lookup did).
+*/
+int resolve_slot(
+    const string &name, const vector<TypedObject> &action_params,
+    const vector<TypedObject> *eff_params) {
+    if (eff_params) {
+        for (int i = static_cast<int>(eff_params->size()) - 1; i >= 0; --i)
+            if ((*eff_params)[i].name == name)
+                return static_cast<int>(action_params.size()) + i;
+    }
+    for (int i = static_cast<int>(action_params.size()) - 1; i >= 0; --i)
+        if (action_params[i].name == name)
+            return i;
+    return -1;
+}
+
+CompiledLiteral compile_literal(
+    const Literal &lit, bool negated, const vector<TypedObject> &action_params,
+    const vector<TypedObject> *eff_params) {
+    CompiledLiteral out;
+    out.predicate = lit.predicate_id;
+    out.negated = negated;
+    out.args.reserve(lit.args.size());
+    for (const auto &a : lit.args) {
+        int slot = resolve_slot(a, action_params, eff_params);
+        out.args.push_back(
+            slot >= 0 ? ~slot : grounding::symbols().intern(a));
+    }
+    return out;
+}
+
+// Flatten `cond` into literals (in tree order, matching the instantiate()
+// walk). Returns false on a shape the compiler does not handle.
+bool compile_condition(
+    const ConditionPtr &cond, const vector<TypedObject> &action_params,
+    const vector<TypedObject> *eff_params, vector<CompiledLiteral> &out) {
+    if (!cond)
+        return true;
+    switch (cond->kind()) {
+    case Condition::Kind::TRUTH:
+        return true;
+    case Condition::Kind::ATOM:
+        out.push_back(compile_literal(
+            static_cast<const Literal &>(*cond), false, action_params,
+            eff_params));
+        return true;
+    case Condition::Kind::NEGATED_ATOM:
+        out.push_back(compile_literal(
+            static_cast<const Literal &>(*cond), true, action_params,
+            eff_params));
+        return true;
+    case Condition::Kind::CONJUNCTION:
+        for (const auto &c : cond->parts())
+            if (c && !compile_condition(c, action_params, eff_params, out))
+                return false;
+        return true;
+    case Condition::Kind::EXISTENTIAL:
+        // Mirrors ExistentialCondition::instantiate: only body[0] is
+        // walked; the quantified parameters get no bindings of their own.
+        return cond->parts().empty() ||
+               compile_condition(
+                   cond->parts()[0], action_params, eff_params, out);
+    default:
+        return false;
+    }
+}
+
+CompiledAction compile_action(
+    const Action &action,
+    const unordered_map<string, vector<int>> &objects_by_type) {
+    CompiledAction ca;
+    if (!compile_condition(
+            action.precondition, action.parameters, nullptr, ca.precondition))
+        return ca;
+    size_t max_eff_params = 0;
+    for (const auto &eff : action.effects) {
+        CompiledEffect ce;
+        if (!eff.literal)
+            continue; // no literal -> the effect can never emit anything
+        auto lk = eff.literal->kind();
+        if (lk != Condition::Kind::ATOM && lk != Condition::Kind::NEGATED_ATOM)
+            return ca;
+        if (!compile_condition(
+                eff.condition, action.parameters, &eff.parameters,
+                ce.condition))
+            return ca;
+        ce.literal = compile_literal(
+            static_cast<const Literal &>(*eff.literal),
+            lk == Condition::Kind::NEGATED_ATOM, action.parameters,
+            &eff.parameters);
+        ce.param_domains.reserve(eff.parameters.size());
+        for (const auto &par : eff.parameters) {
+            auto it = objects_by_type.find(par.type_name);
+            if (it == objects_by_type.end()) {
+                ce.dead = true;
+                break;
+            }
+            ce.param_domains.push_back(&it->second);
+        }
+        max_eff_params = max(max_eff_params, eff.parameters.size());
+        ca.effects.push_back(move(ce));
+    }
+    ca.num_slots = action.parameters.size() + max_eff_params;
+    ca.usable = true;
+    return ca;
+}
+
+// Probe one compiled literal under `slots`, appending fluent literals to
+// `result`. Same single-probe classification as Atom/NegatedAtom::
+// instantiate: fluent -> real literal, static-true -> satisfied (positive) /
+// falsified (negative), absent -> falsified (positive) / satisfied (negative).
+bool probe_compiled(
+    const CompiledLiteral &lit, const vector<int> &slots,
+    const FactMap &facts, vector<GroundLiteral> &result) {
+    static thread_local GroundKey key;
+    key.predicate = lit.predicate;
+    key.args.clear();
+    for (int a : lit.args)
+        key.args.push_back(a < 0 ? slots[~a] : a);
+    const FactId *id = facts.find(key);
+    if (!lit.negated) {
+        if (!id)
+            return false;
+        if (*id != STATIC_FACT)
+            result.push_back({*id, false});
+        return true;
+    }
+    if (!id)
+        return true;
+    if (*id != STATIC_FACT) {
+        result.push_back({*id, true});
+        return true;
+    }
+    return false;
+}
+
+// Enumerate assignments of effect parameters `depth..` (product of the
+// compiled domains, same order as for_each_assignment) and emit one ground
+// effect per satisfied assignment.
+void emit_compiled_effect(
+    const CompiledEffect &ce, vector<int> &slots, size_t base, size_t depth,
+    const FactMap &fluent_facts, vector<GroundEffect> &result) {
+    if (depth == ce.param_domains.size()) {
+        vector<GroundLiteral> condition;
+        for (const auto &lit : ce.condition)
+            if (!probe_compiled(lit, slots, fluent_facts, condition))
+                return;
+        vector<GroundLiteral> lit_out;
+        if (probe_compiled(ce.literal, slots, fluent_facts, lit_out) &&
+            !lit_out.empty())
+            result.emplace_back(move(condition), lit_out[0]);
+        return;
+    }
+    for (int obj : *ce.param_domains[depth]) {
+        slots[base + depth] = obj;
+        emit_compiled_effect(
+            ce, slots, base, depth + 1, fluent_facts, result);
+    }
+}
+
+optional<PropositionalAction> instantiate_action_compiled(
+    const Action &action, const CompiledAction &ca,
+    const grounding::Atom &atom, const vector<string> &args,
+    const InitAssignments &init_assignments, const FactMap &fluent_facts,
+    bool use_metric) {
+    static thread_local vector<int> slots;
+    slots.assign(ca.num_slots, 0);
+    for (size_t i = 0; i < action.parameters.size(); ++i)
+        slots[i] = atom.args[i].v;
+
+    vector<GroundLiteral> precondition;
+    for (const auto &lit : ca.precondition)
+        if (!probe_compiled(lit, slots, fluent_facts, precondition))
+            return nullopt;
+
+    vector<GroundEffect> effects;
+    for (const auto &ce : ca.effects) {
+        if (ce.dead)
+            continue;
+        emit_compiled_effect(
+            ce, slots, action.parameters.size(), 0, fluent_facts, effects);
+    }
+    if (effects.empty() && !get_options().keep_no_ops)
+        return nullopt;
+
+    // Grounded name: same format as instantiate_action (see the trailing-
+    // space note there).
+    string name = "(" + action.name + " ";
+    for (int i = 0; i < action.num_external_parameters; ++i) {
+        if (i > 0)
+            name.push_back(' ');
+        name += args[i];
+    }
+    name.push_back(')');
+
+    long long cost = 1;
+    if (use_metric) {
+        // resolve_action_cost only reads the mapping for PNE costs; rebuild
+        // it just for that (rare) case.
+        static thread_local VarMapping var_mapping;
+        var_mapping.clear();
+        for (size_t i = 0; i < action.parameters.size(); ++i)
+            var_mapping[action.parameters[i].name] =
+                static_cast<int>(slots[i]);
+        cost = resolve_action_cost(
+            action, var_mapping, init_assignments, use_metric);
+    }
+    return PropositionalAction(
+        name, move(precondition), move(effects), static_cast<int>(cost));
+}
+
 optional<PropositionalAction> instantiate_action(
     const Action &action, const vector<string> &args,
     const InitAssignments &init_assignments, const FactMap &fluent_facts,
@@ -375,6 +628,14 @@ Result instantiate(
     auto init_assignments = build_init_assignments(task);
     auto objects_by_type = get_objects_by_type(task);
 
+    // One compiled form per schema; ground actions of unsupported schemas
+    // take the original tree-walking path. (objects_by_type outlives the
+    // compiled domain pointers; it is not mutated below.)
+    vector<CompiledAction> compiled_actions;
+    compiled_actions.reserve(task.actions.size());
+    for (const auto &action : task.actions)
+        compiled_actions.push_back(compile_action(action, objects_by_type));
+
     for (const auto &atom : model) {
         switch (roles.role_of(atom.predicate)) {
         case grounding::PredicateRole::GOAL_REACHABLE:
@@ -398,9 +659,15 @@ Result instantiate(
                 args.push_back(grounding::arg_to_string(atom.args[i]));
                 arg_ids.push_back(atom.args[i].v);
             }
-            auto inst = instantiate_action(
-                action, args, init_assignments, fluent_facts, objects_by_type,
-                task.use_min_cost_metric);
+            const CompiledAction &ca = compiled_actions[action_idx];
+            auto inst = ca.usable
+                            ? instantiate_action_compiled(
+                                  action, ca, atom, args, init_assignments,
+                                  fluent_facts, task.use_min_cost_metric)
+                            : instantiate_action(
+                                  action, args, init_assignments,
+                                  fluent_facts, objects_by_type,
+                                  task.use_min_cost_metric);
             out.reachable_action_parameters[action_idx].push_back(
                 move(arg_ids));
             if (inst)
