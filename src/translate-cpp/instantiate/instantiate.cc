@@ -626,45 +626,42 @@ optional<vector<ConditionPtr>> instantiate_goal(
 }
 }
 
-Result instantiate(
-    const Task &task, const vector<grounding::Atom> &model,
-    const grounding::PredicateRoles &roles,
-    const unordered_map<int, vector<grounding::Atom>> *negated_statics) {
-    Result out;
-    // Extensions of the static predicates referenced by negated
-    // preconditions, probed to skip statically inapplicable ground actions
-    // with one lookup. The equality facts =(o, o) are ordinary init facts
-    // in the model, so inequality constraints need no special case.
-    unordered_set<grounding::Atom, grounding::AtomHash> static_atoms;
-    if (negated_statics && !negated_statics->empty()) {
-        // Equality is handled by value comparison below; only other static
-        // predicates need their extensions materialized.
-        const int eq = grounding::symbols().intern("=");
+namespace {
+/*
+  Probe machinery for negated static preconditions: extensions of the
+  referenced static predicates (probed to skip statically inapplicable
+  ground actions with one lookup), with inequality constraints resolved by
+  comparing the two bound values. The equality facts =(o, o) are ordinary
+  init facts in the model, so inequality needs no special extension.
+*/
+class NegatedStaticFilter {
+public:
+    NegatedStaticFilter(
+        const unordered_map<int, vector<grounding::Atom>> *negated_statics,
+        const vector<grounding::Atom> &model)
+        : negatives_(negated_statics),
+          eq_pred_(grounding::symbols().intern("=")) {
+        if (!negatives_ || negatives_->empty())
+            return;
         unordered_set<int> referenced;
-        for (const auto &[pred, negs] : *negated_statics)
+        for (const auto &[pred, negs] : *negatives_)
             for (const auto &n : negs)
-                if (n.predicate != eq)
+                if (n.predicate != eq_pred_)
                     referenced.insert(n.predicate);
         if (!referenced.empty())
             for (const auto &a : model)
                 if (referenced.contains(a.predicate))
-                    static_atoms.insert(a);
+                    static_atoms_.insert(a);
     }
-    size_t statically_inapplicable = 0;
-    const int eq_pred = grounding::symbols().intern("=");
-    grounding::Atom probe("", {});
-    auto violates_negated_static = [&](const grounding::Atom &atom) {
-        if (!negated_statics || negated_statics->empty())
+
+    bool violates(const grounding::Atom &atom) {
+        if (!negatives_ || negatives_->empty())
             return false;
-        auto ni = negated_statics->find(atom.predicate);
-        if (ni == negated_statics->end())
+        auto ni = negatives_->find(atom.predicate);
+        if (ni == negatives_->end())
             return false;
         for (const grounding::Atom &neg : ni->second) {
-            // Inequality constraints (the common case: orgsyn, GED,
-            // caldera) resolve by comparing the two bound values -- no
-            // probe. The generic path handles any other static predicate
-            // via the =(o, o)-style extension probe.
-            if (neg.predicate == eq_pred && neg.args.size() == 2) {
+            if (neg.predicate == eq_pred_ && neg.args.size() == 2) {
                 const grounding::Arg &x = neg.args[0];
                 const grounding::Arg &y = neg.args[1];
                 int xv = x.is_position() ? atom.args[x.position()].v : x.v;
@@ -673,16 +670,37 @@ Result instantiate(
                     return true;
                 continue;
             }
-            probe.predicate = neg.predicate;
-            probe.args.clear();
+            probe_.predicate = neg.predicate;
+            probe_.args.clear();
             for (const grounding::Arg &arg : neg.args)
-                probe.args.push_back(
+                probe_.args.push_back(
                     arg.is_position() ? atom.args[arg.position()] : arg);
-            if (static_atoms.contains(probe))
+            if (static_atoms_.contains(probe_))
                 return true;
         }
         return false;
-    };
+    }
+
+private:
+    const unordered_map<int, vector<grounding::Atom>> *negatives_;
+    unordered_set<grounding::Atom, grounding::AtomHash> static_atoms_;
+    int eq_pred_;
+    grounding::Atom probe_{"", {}};
+};
+}
+
+Result instantiate(
+    const Task &task, const vector<grounding::Atom> &model,
+    const grounding::PredicateRoles &roles,
+    const unordered_map<int, vector<grounding::Atom>> *negated_statics,
+    bool defer_actions) {
+    Result out;
+    // With defer_actions, ground actions are neither filtered nor
+    // instantiated here (for_each_action streams them later); only their
+    // parameters are recorded for the invariant finder.
+    NegatedStaticFilter filter(
+        defer_actions ? nullptr : negated_statics, model);
+    size_t statically_inapplicable = 0;
     out.reachable_action_parameters.resize(task.actions.size());
     auto fluent_preds = get_fluent_predicates(task);
     auto fluent = build_fluent_facts(model, fluent_preds);
@@ -699,11 +717,13 @@ Result instantiate(
     // take the original tree-walking path. (objects_by_type outlives the
     // compiled domain pointers; it is not mutated below.)
     vector<CompiledAction> compiled_actions;
-    compiled_actions.reserve(task.actions.size());
-    for (const auto &action : task.actions)
-        compiled_actions.push_back(compile_action(
-            action, objects_by_type,
-            negated_statics ? &fluent_preds : nullptr));
+    if (!defer_actions) {
+        compiled_actions.reserve(task.actions.size());
+        for (const auto &action : task.actions)
+            compiled_actions.push_back(compile_action(
+                action, objects_by_type,
+                negated_statics ? &fluent_preds : nullptr));
+    }
 
     for (const auto &atom : model) {
         switch (roles.role_of(atom.predicate)) {
@@ -726,12 +746,17 @@ Result instantiate(
             arg_ids.reserve(action.parameters.size());
             for (size_t i = 0; i < action.parameters.size(); ++i)
                 arg_ids.push_back(atom.args[i].v);
+            if (defer_actions) {
+                out.reachable_action_parameters[action_idx].push_back(
+                    move(arg_ids));
+                break;
+            }
             // A statically inapplicable action (violated negated static
             // precondition) skips instantiation entirely, but its
             // parameters are still recorded below: the invariant finder
             // must see the same reachable-parameter sets either way.
             optional<PropositionalAction> inst;
-            if (violates_negated_static(atom)) {
+            if (filter.violates(atom)) {
                 ++statically_inapplicable;
             } else {
                 for (size_t i = 0; i < action.parameters.size(); ++i)
@@ -777,5 +802,53 @@ Result instantiate(
     out.instantiated_goal =
         instantiate_goal(task.goal, fluent_facts, fact_by_id);
     return out;
+}
+
+void for_each_action(
+    const Task &task, const vector<grounding::Atom> &model,
+    const grounding::PredicateRoles &roles,
+    const unordered_map<int, vector<grounding::Atom>> *negated_statics,
+    const FactMap &fluent_facts,
+    const function<void(PropositionalAction &&)> &sink) {
+    NegatedStaticFilter filter(negated_statics, model);
+    auto fluent_preds = get_fluent_predicates(task);
+    auto init_assignments = build_init_assignments(task);
+    auto objects_by_type = get_objects_by_type(task);
+    vector<CompiledAction> compiled_actions;
+    compiled_actions.reserve(task.actions.size());
+    for (const auto &action : task.actions)
+        compiled_actions.push_back(compile_action(
+            action, objects_by_type,
+            negated_statics ? &fluent_preds : nullptr));
+    size_t statically_inapplicable = 0;
+    for (const auto &atom : model) {
+        if (roles.role_of(atom.predicate) != grounding::PredicateRole::ACTION)
+            continue;
+        int action_idx = roles.index_of(atom.predicate);
+        const Action &action = task.actions[action_idx];
+        if (atom.args.size() < action.parameters.size())
+            continue;
+        if (filter.violates(atom)) {
+            ++statically_inapplicable;
+            continue;
+        }
+        vector<string> args;
+        args.reserve(action.parameters.size());
+        for (size_t i = 0; i < action.parameters.size(); ++i)
+            args.push_back(grounding::arg_to_string(atom.args[i]));
+        const CompiledAction &ca = compiled_actions[action_idx];
+        auto inst = ca.usable
+                        ? instantiate_action_compiled(
+                              action, ca, atom, args, init_assignments,
+                              fluent_facts, task.use_min_cost_metric)
+                        : instantiate_action(
+                              action, args, init_assignments, fluent_facts,
+                              objects_by_type, task.use_min_cost_metric);
+        if (inst)
+            sink(move(*inst));
+    }
+    if (statically_inapplicable > 0)
+        cout << statically_inapplicable
+             << " actions violate negated static preconditions." << endl;
 }
 }

@@ -973,18 +973,28 @@ SASTask pddl_to_sas(Task &task) {
         });
         built.deferred_actions = grounding::Program{};
     }
+    const auto *negated_statics =
+        built.has_deferred ? &built.deferred_negatives : nullptr;
+    // Without axioms, ground actions are streamed through translation later
+    // (for_each_action) instead of materialized here: the
+    // PropositionalAction vector never exists, and each action is
+    // translated while its data is hot. Axiom processing consumes the batch
+    // action vector, so axiom tasks keep the batch path.
+    const bool fuse_actions = task.axioms.empty();
     auto inst = phase("Completing instantiation", [&] {
         return instantiate::instantiate(
-            task, model, prog.predicate_roles,
-            built.has_deferred ? &built.deferred_negatives : nullptr);
+            task, model, prog.predicate_roles, negated_statics,
+            /*defer_actions=*/fuse_actions);
     });
     // The grounded model and the Datalog program are only needed through
-    // instantiation. Release them now (they can be hundreds of MB on large
-    // tasks) so the memory-heavy STRIPS->SAS phases below don't hold them --
-    // on logistics/blocksworld-large the peak occurs during translation, not
-    // grounding, so this directly lowers peak RSS.
-    model = vector<grounding::Atom>{};
-    prog = grounding::Program{};
+    // instantiation (or through the fused translation pass, which re-walks
+    // the model). Release them as early as possible (they can be hundreds
+    // of MB on large tasks) so the memory-heavy STRIPS->SAS phases don't
+    // hold them.
+    if (!fuse_actions) {
+        model = vector<grounding::Atom>{};
+        prog = grounding::Program{};
+    }
 
     if (!inst.relaxed_reachable) {
         cout << "No relaxed solution! Generating unsolvable task..." << endl;
@@ -1056,12 +1066,24 @@ SASTask pddl_to_sas(Task &task) {
     // Build operators.
     vector<SASOperator> sas_operators;
     phase("Translating task", [&] {
-        for (const auto &op : inst.instantiated_actions) {
+        auto translate_one = [&](const PropositionalAction &op) {
             auto sub = translate_strips_operator(
                 op, strips_to_sas.factvals, strips_to_sas.ranges,
                 mutex_dict.factvals, mutex_dict.ranges, implied_facts);
             for (auto &o : sub)
                 sas_operators.push_back(move(o));
+        };
+        if (fuse_actions) {
+            instantiate::for_each_action(
+                task, model, prog.predicate_roles, negated_statics,
+                fluent_ids, [&](PropositionalAction &&op) {
+                    translate_one(op);
+                });
+            model = vector<grounding::Atom>{};
+            prog = grounding::Program{};
+        } else {
+            for (const auto &op : inst.instantiated_actions)
+                translate_one(op);
         }
         return 0;
     });

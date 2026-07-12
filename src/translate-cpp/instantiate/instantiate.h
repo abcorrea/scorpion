@@ -4,6 +4,7 @@
 #include "../grounding/program.h"
 #include "../pddl/task.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -55,7 +56,25 @@ Result instantiate(
     const pddl::Task &task, const std::vector<grounding::Atom> &model,
     const grounding::PredicateRoles &roles,
     const std::unordered_map<int, std::vector<grounding::Atom>>
-        *negated_statics = nullptr);
+        *negated_statics = nullptr,
+    bool defer_actions = false);
+
+/*
+  Stream the instantiated ground actions to `sink`, in the same order and
+  with the same semantics as the batch path in instantiate(). Used with
+  instantiate(..., defer_actions=true) to fuse action instantiation with
+  operator translation: the multi-hundred-MB PropositionalAction vector is
+  never materialized, and each action is translated while its data is hot.
+  Only valid for tasks without axioms (axiom processing consumes the batch
+  action vector).
+*/
+void for_each_action(
+    const pddl::Task &task, const std::vector<grounding::Atom> &model,
+    const grounding::PredicateRoles &roles,
+    const std::unordered_map<int, std::vector<grounding::Atom>>
+        *negated_statics,
+    const pddl::FactMap &fluent_facts,
+    const std::function<void(pddl::PropositionalAction &&)> &sink);
 }
 
 #endif
