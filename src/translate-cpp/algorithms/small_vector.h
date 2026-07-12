@@ -183,6 +183,18 @@ public:
         size_ = 0;
     }
 
+    void pop_back() noexcept {
+        --size_;
+        std::destroy_at(data_ptr() + size_);
+    }
+
+    // Remove the element at `pos`, shifting later elements down.
+    iterator erase(iterator pos) noexcept {
+        std::move(pos + 1, end(), pos);
+        pop_back();
+        return pos;
+    }
+
     T &operator[](std::size_t i) noexcept {
         return data_ptr()[i];
     }

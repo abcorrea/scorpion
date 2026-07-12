@@ -284,49 +284,46 @@ bool add_negative_conditions(
         const auto &varvals = factvals[lit.fact];
         if (varvals.empty())
             continue;
+        // For variables already constrained, intersecting with "domain minus
+        // val" is just erasing val in place -- no materialized domain set.
+        // (When any representation constrains an existing entry, the
+        // unconstrained representations are dropped entirely, mirroring
+        // Python: its `new_condition` is only applied when `done` is false.)
         bool done = false;
-        CondMap new_condition;
         for (const auto &[var, val] : varvals) {
-            // Ascending order => sorted and duplicate-free by construction.
-            ValueSet poss_vals;
-            poss_vals.reserve(ranges[var] - 1);
-            for (int v = 0; v < ranges[var]; ++v)
-                if (v != val)
-                    poss_vals.push_back(v);
             auto cit = condition.find(var);
-            if (cit == condition.end()) {
-                new_condition[var] = move(poss_vals);
-            } else {
-                done = true;
-                ValueSet intersection;
-                set_intersection(
-                    cit->second.begin(), cit->second.end(), poss_vals.begin(),
-                    poss_vals.end(), back_inserter(intersection));
-                if (intersection.empty())
-                    return false;
-                cit->second = move(intersection);
-            }
+            if (cit == condition.end())
+                continue;
+            done = true;
+            ValueSet &vals = cit->second;
+            auto pos = lower_bound(vals.begin(), vals.end(), val);
+            if (pos != vals.end() && *pos == val)
+                vals.erase(pos);
+            if (vals.empty())
+                return false;
         }
-        if (!done && !new_condition.empty()) {
-            // Pick the smallest-cardinality candidate, breaking ties by the
-            // order the representations appear in the dictionary. Python sorts
-            // new_condition.items() by cardinality with a stable sort, so among
-            // equal sizes it keeps the first-inserted (= dictionary) order. We
-            // must iterate the dictionary entries (it->second) here rather than
-            // the unordered new_condition map, whose iteration order is
-            // unspecified -- otherwise full-encoding facts with several equal-
-            // size representations pick a different variable than Python.
-            int best_var = -1;
-            size_t best_size = SIZE_MAX;
+        if (!done) {
+            // Store "domain minus val" for the smallest-cardinality
+            // representation only. Python builds every candidate set and
+            // stable-sorts by cardinality, so among equal sizes the
+            // first-listed representation wins; the size is ranges[var] - 1,
+            // so the winner is known without materializing the losers.
+            int best_var = -1, best_val = -1;
+            int best_size = INT_MAX;
             for (const auto &[var, val] : varvals) {
-                auto nit = new_condition.find(var);
-                if (nit != new_condition.end() &&
-                    nit->second.size() < best_size) {
-                    best_size = nit->second.size();
+                if (ranges[var] - 1 < best_size) {
+                    best_size = ranges[var] - 1;
                     best_var = var;
+                    best_val = val;
                 }
             }
-            condition[best_var] = move(new_condition[best_var]);
+            // Ascending order => sorted and duplicate-free by construction.
+            ValueSet poss_vals;
+            poss_vals.reserve(best_size);
+            for (int v = 0; v < ranges[best_var]; ++v)
+                if (v != best_val)
+                    poss_vals.push_back(v);
+            condition[best_var] = move(poss_vals);
         }
     }
     return true;
