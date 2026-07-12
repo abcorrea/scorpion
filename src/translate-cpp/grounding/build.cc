@@ -284,7 +284,10 @@ void ground_deferred_actions(
         if (keep[a.predicate])
             deferred.add_fact(a);
     deferred.normalize();
-    split_rules(deferred);
+    // Relations are complete here, so their statistics can drive the join
+    // order.
+    ExtensionStats stats = ExtensionStats::of(deferred.facts);
+    split_rules(deferred, &stats);
     auto action_model = compute_model(deferred);
     // Precompute action predicates by id; split_rules interned fresh aux
     // names, so re-size against the current symbol table.

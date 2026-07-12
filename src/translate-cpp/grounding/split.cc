@@ -109,25 +109,134 @@ Cost compute_join_cost(const Atom &left, const Atom &right) {
         static_cast<int>(rv.size()) - common, -common};
 }
 
-vector<Rule> greedy_join(const Rule &rule, Program &prog) {
+/*
+  Size/selectivity profile of one joinee for size-aware join ordering:
+  estimated tuple count plus estimated distinct values per variable.
+*/
+struct JoineeStats {
+    double est = 0.0;
+    unordered_map<string, double> distinct;
+};
+
+JoineeStats base_stats(const Atom &atom, const ExtensionStats &stats) {
+    JoineeStats out;
+    auto sz = stats.size.find(atom.predicate);
+    out.est = sz == stats.size.end() ? 0.0 : static_cast<double>(sz->second);
+    auto ds = stats.distinct.find(atom.predicate);
+    for (size_t i = 0; i < atom.args.size(); ++i) {
+        const Arg &a = atom.args[i];
+        if (!a.is_symbol())
+            continue;
+        const string &name = a.name();
+        if (name.empty() || name.front() != '?')
+            continue;
+        double d = out.est;
+        if (ds != stats.distinct.end() && i < ds->second.size())
+            d = static_cast<double>(ds->second[i]);
+        auto [it, inserted] = out.distinct.emplace(name, d);
+        // The same variable at several positions: the tighter bound wins.
+        if (!inserted)
+            it->second = min(it->second, d);
+    }
+    return out;
+}
+
+// System-R estimate of |a >< b|: sizes divided, per shared variable, by the
+// larger distinct count. Cross products fall out naturally (no divisor).
+double estimate_join(const JoineeStats &a, const JoineeStats &b) {
+    double est = a.est * b.est;
+    for (const auto &[v, da] : a.distinct) {
+        auto it = b.distinct.find(v);
+        if (it != b.distinct.end())
+            est /= max({da, it->second, 1.0});
+    }
+    return est;
+}
+
+JoineeStats join_stats(
+    const JoineeStats &a, const JoineeStats &b, double est) {
+    JoineeStats out;
+    out.est = est;
+    for (const auto &[v, d] : a.distinct)
+        out.distinct[v] = min(d, est);
+    for (const auto &[v, d] : b.distinct) {
+        auto [it, inserted] = out.distinct.emplace(v, min(d, est));
+        if (!inserted)
+            it->second = min(it->second, min(d, est));
+    }
+    return out;
+}
+
+vector<Rule> greedy_join(
+    const Rule &rule, Program &prog, const ExtensionStats *stats) {
     vector<Atom> joinees = rule.conditions;
     OccurrencesTracker occ;
     occ.update(rule.effect, +1);
     for (const auto &c : rule.conditions)
         occ.update(c, +1);
 
+    // Per-joinee size/selectivity profiles (size-aware mode only), kept
+    // aligned with `joinees`.
+    vector<JoineeStats> jstats;
+    if (stats) {
+        jstats.reserve(joinees.size());
+        for (const auto &c : joinees)
+            jstats.push_back(base_stats(c, *stats));
+    }
+    // Index of the current intermediate (size-aware mode), -1 before the
+    // first join.
+    int cur = -1;
+
     vector<Rule> result;
     while (joinees.size() >= 2) {
-        // Find min-cost pair.
-        Cost best{INT_MAX, INT_MAX, INT_MAX};
         size_t bi = 0, bj = 0;
-        for (size_t i = 0; i < joinees.size(); ++i) {
-            for (size_t j = 0; j < i; ++j) {
-                Cost c = compute_join_cost(joinees[i], joinees[j]);
-                if (c < best) {
-                    best = c;
-                    bi = i;
-                    bj = j;
+        JoineeStats next_stats;
+        if (stats) {
+            /*
+              Left-deep, estimate-driven order: the anchor is the smallest
+              relation (first round) or the running intermediate; the
+              partner minimizes the estimated join size, cross products
+              included -- joining a selective one-tuple relation "across"
+              is often the best move (e.g. at_lander in Rovers' communicate
+              schemas), and forbidding it forces fanout joins that
+              materialize millions of tuples. Ties break on the lower
+              index (deterministic).
+            */
+            size_t anchor;
+            if (cur >= 0) {
+                anchor = static_cast<size_t>(cur);
+            } else {
+                anchor = 0;
+                for (size_t i = 1; i < joinees.size(); ++i)
+                    if (jstats[i].est < jstats[anchor].est)
+                        anchor = i;
+            }
+            size_t partner = joinees.size();
+            double best_est = 0.0;
+            for (size_t i = 0; i < joinees.size(); ++i) {
+                if (i == anchor)
+                    continue;
+                double e = estimate_join(jstats[anchor], jstats[i]);
+                if (partner == joinees.size() || e < best_est) {
+                    partner = i;
+                    best_est = e;
+                }
+            }
+            next_stats =
+                join_stats(jstats[anchor], jstats[partner], best_est);
+            bi = max(anchor, partner);
+            bj = min(anchor, partner);
+        } else {
+            // Find min-cost pair.
+            Cost best{INT_MAX, INT_MAX, INT_MAX};
+            for (size_t i = 0; i < joinees.size(); ++i) {
+                for (size_t j = 0; j < i; ++j) {
+                    Cost c = compute_join_cost(joinees[i], joinees[j]);
+                    if (c < best) {
+                        best = c;
+                        bi = i;
+                        bj = j;
+                    }
                 }
             }
         }
@@ -136,6 +245,10 @@ vector<Rule> greedy_join(const Rule &rule, Program &prog) {
         // Remove larger index first.
         joinees.erase(joinees.begin() + bi);
         joinees.erase(joinees.begin() + bj);
+        if (stats) {
+            jstats.erase(jstats.begin() + bi);
+            jstats.erase(jstats.begin() + bj);
+        }
         occ.update(left, -1);
         occ.update(right, -1);
 
@@ -187,6 +300,10 @@ vector<Rule> greedy_join(const Rule &rule, Program &prog) {
         result.push_back(join_rule);
         joinees.push_back(join_effect);
         occ.update(join_effect, +1);
+        if (stats) {
+            jstats.push_back(move(next_stats));
+            cur = static_cast<int>(joinees.size()) - 1;
+        }
     }
     // Final result rule: replace last result's effect with the rule's
     // original effect.
@@ -198,12 +315,13 @@ vector<Rule> greedy_join(const Rule &rule, Program &prog) {
     return result;
 }
 
-vector<Rule> split_into_binary_rules(Rule rule, Program &prog) {
+vector<Rule> split_into_binary_rules(
+    Rule rule, Program &prog, const ExtensionStats *stats) {
     if (rule.conditions.size() <= 1) {
         rule.kind = RuleKind::PROJECT;
         return {rule};
     }
-    return greedy_join(rule, prog);
+    return greedy_join(rule, prog, stats);
 }
 
 /*
@@ -289,7 +407,8 @@ void merge_duplicate_rules(Program &prog) {
         cout << "Merged " << merged << " duplicate rules." << endl;
 }
 
-vector<Rule> split_rule(const Rule &rule, Program &prog) {
+vector<Rule> split_rule(
+    const Rule &rule, Program &prog, const ExtensionStats *stats) {
     vector<Atom> important, trivial;
     for (const auto &c : rule.conditions) {
         bool has_var = false;
@@ -306,7 +425,7 @@ vector<Rule> split_rule(const Rule &rule, Program &prog) {
     }
     auto components = get_connected_conditions(important);
     if (components.size() == 1 && trivial.empty()) {
-        return split_into_binary_rules(rule, prog);
+        return split_into_binary_rules(rule, prog, stats);
     }
     vector<Rule> projected_rules;
     projected_rules.reserve(components.size());
@@ -314,7 +433,7 @@ vector<Rule> split_rule(const Rule &rule, Program &prog) {
         projected_rules.push_back(project_rule(rule.effect, comp, prog));
     vector<Rule> result;
     for (auto &pr : projected_rules) {
-        auto sub = split_into_binary_rules(pr, prog);
+        auto sub = split_into_binary_rules(pr, prog, stats);
         for (auto &r : sub)
             result.push_back(move(r));
     }
@@ -332,10 +451,30 @@ vector<Rule> split_rule(const Rule &rule, Program &prog) {
 }
 }
 
-void split_rules(Program &prog) {
+ExtensionStats ExtensionStats::of(const vector<Atom> &facts) {
+    ExtensionStats out;
+    unordered_map<int, vector<unordered_set<int>>> values;
+    for (const Atom &a : facts) {
+        ++out.size[a.predicate];
+        auto &vals = values[a.predicate];
+        if (vals.size() < a.args.size())
+            vals.resize(a.args.size());
+        for (size_t i = 0; i < a.args.size(); ++i)
+            vals[i].insert(a.args[i].v);
+    }
+    for (auto &[pred, vals] : values) {
+        auto &d = out.distinct[pred];
+        d.reserve(vals.size());
+        for (const auto &v : vals)
+            d.push_back(v.size());
+    }
+    return out;
+}
+
+void split_rules(Program &prog, const ExtensionStats *stats) {
     vector<Rule> new_rules;
     for (const auto &r : prog.rules) {
-        auto sub = split_rule(r, prog);
+        auto sub = split_rule(r, prog, stats);
         for (auto &nr : sub)
             new_rules.push_back(move(nr));
     }
