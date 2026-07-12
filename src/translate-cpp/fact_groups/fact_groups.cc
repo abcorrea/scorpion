@@ -60,20 +60,54 @@ struct ReachableIndex {
     unordered_map<GroundKey, vector<ConditionPtr>, GroundKeyHash> by_wildcard;
 };
 
-ReachableIndex build_reachable_index(const AtomSet &reachable_facts) {
+/*
+  Only patterns a candidate can actually query get indexed: candidates
+  determine the (predicate, wildcard position) pairs and the predicates of
+  concrete probes. Indexing every atom at every position built millions of
+  never-queried entries on fact-heavy tasks.
+*/
+ReachableIndex build_reachable_index(
+    const AtomSet &reachable_facts,
+    const vector<vector<ConditionPtr>> &groups) {
+    unordered_set<int> exact_preds;
+    unordered_set<long long> wildcard_slots; // (predicate << 8) | position
+    for (const auto &g : groups) {
+        for (const auto &fact : g) {
+            if (!fact || fact->kind() != Condition::Kind::ATOM)
+                continue;
+            const auto &atom = static_cast<const Atom &>(*fact);
+            int pos = find_placeholder(atom);
+            if (pos < 0)
+                exact_preds.insert(atom.predicate_id);
+            else
+                wildcard_slots.insert(
+                    (static_cast<long long>(atom.predicate_id) << 8) | pos);
+        }
+    }
     ReachableIndex index;
-    index.exact.reserve(reachable_facts.size());
     for (const auto &f : reachable_facts) {
         if (!f || f->kind() != Condition::Kind::ATOM)
             continue;
-        GroundKey key = atom_key(static_cast<const Literal &>(*f));
+        const auto &lit = static_cast<const Literal &>(*f);
+        bool exact = exact_preds.contains(lit.predicate_id);
+        bool any_wildcard = false;
+        for (size_t pos = 0; pos < lit.args.size() && !any_wildcard; ++pos)
+            any_wildcard = wildcard_slots.contains(
+                (static_cast<long long>(lit.predicate_id) << 8) | pos);
+        if (!exact && !any_wildcard)
+            continue;
+        GroundKey key = atom_key(lit);
         for (size_t pos = 0; pos < key.args.size(); ++pos) {
+            if (!wildcard_slots.contains(
+                    (static_cast<long long>(lit.predicate_id) << 8) | pos))
+                continue;
             int obj = key.args[pos];
             key.args[pos] = WILDCARD;
             index.by_wildcard[key].push_back(f);
             key.args[pos] = obj;
         }
-        index.exact.emplace(move(key), f);
+        if (exact)
+            index.exact.emplace(move(key), f);
     }
     return index;
 }
@@ -108,7 +142,7 @@ vector<ConditionPtr> expand_group(
 vector<vector<ConditionPtr>> instantiate_groups(
     const vector<vector<ConditionPtr>> &groups,
     const AtomSet &reachable_facts) {
-    ReachableIndex reachable = build_reachable_index(reachable_facts);
+    ReachableIndex reachable = build_reachable_index(reachable_facts, groups);
     vector<vector<ConditionPtr>> result;
     result.reserve(groups.size());
     for (const auto &g : groups)
