@@ -18,6 +18,7 @@ void usage(ostream &os, const char *prog) {
        << "    [--skip-variable-reordering] [--keep-unimportant-variables]\n"
        << "    [--keep-no-ops] [--keep-duplicate-operators]\n"
        << "    [--no-cpython-rng] [--dump-task]\n"
+       << "    [--eager-action-grounding]\n"
        << "    [--layer-strategy {min,max}]\n"
        << "    DOMAIN_PDDL TASK_PDDL\n";
 }
@@ -77,6 +78,8 @@ void parse_options(int argc, const char *const *argv) {
             o.keep_no_ops = true;
         } else if (a == "--keep-duplicate-operators") {
             o.keep_duplicate_operators = true;
+        } else if (a == "--eager-action-grounding") {
+            o.defer_action_grounding = false;
         } else if (a == "--no-cpython-rng") {
             o.cpython_rng = false;
         } else if (a == "--dump-task") {

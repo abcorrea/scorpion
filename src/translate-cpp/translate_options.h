@@ -22,6 +22,16 @@ struct Options {
     // Fact representation.
     bool use_partial_encoding = true; // --full-encoding flips to false
 
+    // Grounding. Keep the wide action-applicability atoms out of the
+    // reachability program (each effect rule gets the precondition body
+    // directly, so rule splitting can project intermediates down to the
+    // effect's variables) and recover the reachable ground actions in a
+    // second pass against the completed model ("action predicate removal",
+    // Correa et al., ICAPS 2021). --eager-action-grounding restores the
+    // single-pass program, whose model order is byte-compatible with the
+    // Python translator.
+    bool defer_action_grounding = true;
+
     // Invariant generation.
     int invariant_generation_max_candidates = 100000;
     int invariant_generation_max_time = 300;

@@ -844,15 +844,27 @@ SASTask pddl_to_sas(Task &task) {
         return v;
     };
     cout << "Instantiating..." << endl;
-    auto prog = phase("Generating Datalog program", [&] {
+    auto built = phase("Generating Datalog program", [&] {
         return grounding::build_program(task);
     });
+    auto &prog = built.program;
     phase("Normalizing Datalog program", [&] {
         grounding::split_rules(prog);
         return 0;
     });
     auto model = phase(
         "Computing model", [&] { return grounding::compute_model(prog); });
+    if (built.has_deferred) {
+        // Reachable ground actions were kept out of the reachability
+        // program; recover them against the completed model and append
+        // them (instantiate reads them from the model stream).
+        phase("Grounding deferred actions", [&] {
+            grounding::ground_deferred_actions(
+                built.deferred_actions, prog.predicate_roles, model);
+            return 0;
+        });
+        built.deferred_actions = grounding::Program{};
+    }
     auto inst = phase("Completing instantiation", [&] {
         return instantiate::instantiate(task, model, prog.predicate_roles);
     });

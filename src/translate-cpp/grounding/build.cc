@@ -1,5 +1,10 @@
 #include "build.h"
 
+#include "model.h"
+#include "split.h"
+
+#include "../translate_options.h"
+
 #include "../pddl/action.h"
 #include "../pddl/axiom.h"
 #include "../pddl/condition.h"
@@ -171,7 +176,7 @@ void translate_facts(Program &prog, const Task &task) {
     }
 }
 
-void build_exploration_rules(Program &prog, const Task &task) {
+void build_exploration_rules(Program &prog, const Task &task, Program *deferred) {
     for (size_t i = 0; i < task.actions.size(); ++i) {
         const Action &action = task.actions[i];
         Atom head = action_head(action, static_cast<int>(i));
@@ -186,7 +191,13 @@ void build_exploration_rules(Program &prog, const Task &task) {
         }
         auto body =
             condition_to_rule_body(action.parameters, action.precondition, pne);
-        prog.add_rule(Rule{body, head});
+        if (deferred) {
+            deferred->predicate_roles.set(
+                head.predicate, PredicateRole::ACTION, static_cast<int>(i));
+            deferred->add_rule(Rule{body, head});
+        } else {
+            prog.add_rule(Rule{body, head});
+        }
 
         for (const auto &eff : action.effects) {
             if (!eff.literal)
@@ -194,7 +205,17 @@ void build_exploration_rules(Program &prog, const Task &task) {
             const auto &lit = static_cast<const Literal &>(*eff.literal);
             if (lit.negated())
                 continue;
-            vector<Atom> rule_body = {head};
+            // With deferred action grounding, the effect rule carries the
+            // full precondition body instead of the action atom: the least
+            // model on the fluents is unchanged (the action atom was just a
+            // materialized shared subexpression), but rule splitting can now
+            // project intermediates down to the effect's own variables
+            // instead of dragging every action parameter to the wide head.
+            vector<Atom> rule_body;
+            if (deferred)
+                rule_body = body;
+            else
+                rule_body = {head};
             auto sub = condition_to_rule_body({}, eff.condition, nullptr);
             for (auto &c : sub)
                 rule_body.push_back(move(c));
@@ -230,13 +251,56 @@ void build_exploration_rules(Program &prog, const Task &task) {
 }
 }
 
-Program build_program(const Task &task) {
-    Program prog;
+BuiltProgram build_program(const Task &task) {
+    BuiltProgram out;
+    out.has_deferred = get_options().defer_action_grounding;
+    Program &prog = out.program;
     cout << "Generating Datalog program..." << endl;
     translate_facts(prog, task);
-    build_exploration_rules(prog, task);
+    build_exploration_rules(
+        prog, task, out.has_deferred ? &out.deferred_actions : nullptr);
     cout << "Normalizing Datalog program..." << endl;
     prog.normalize();
-    return prog;
+    return out;
+}
+
+void ground_deferred_actions(
+    Program &deferred, const PredicateRoles &phase1_roles,
+    vector<Atom> &model) {
+    // Seed the applicability rules with the complete extension of every
+    // ordinary predicate: everything in the model except auxiliary (p$)
+    // atoms and phase-1 role atoms (axiom heads, @goal-reachable).
+    const size_t num_symbols = symbols().size();
+    vector<char> keep(num_symbols, 0);
+    for (size_t id = 0; id < num_symbols; ++id) {
+        keep[id] =
+            (symbols().name(id).find('$') == string::npos &&
+             phase1_roles.role_of(static_cast<int>(id)) ==
+                 PredicateRole::OTHER)
+                ? 1
+                : 0;
+    }
+    for (const Atom &a : model)
+        if (keep[a.predicate])
+            deferred.add_fact(a);
+    deferred.normalize();
+    split_rules(deferred);
+    auto action_model = compute_model(deferred);
+    // Precompute action predicates by id; split_rules interned fresh aux
+    // names, so re-size against the current symbol table.
+    vector<char> is_action(symbols().size(), 0);
+    for (size_t id = 0; id < is_action.size(); ++id)
+        is_action[id] = deferred.predicate_roles.role_of(
+                            static_cast<int>(id)) == PredicateRole::ACTION
+                            ? 1
+                            : 0;
+    size_t appended = 0;
+    for (auto &a : action_model) {
+        if (is_action[a.predicate]) {
+            model.push_back(move(a));
+            ++appended;
+        }
+    }
+    cout << appended << " reachable ground actions." << endl;
 }
 }
