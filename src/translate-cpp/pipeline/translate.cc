@@ -866,7 +866,9 @@ SASTask pddl_to_sas(Task &task) {
         built.deferred_actions = grounding::Program{};
     }
     auto inst = phase("Completing instantiation", [&] {
-        return instantiate::instantiate(task, model, prog.predicate_roles);
+        return instantiate::instantiate(
+            task, model, prog.predicate_roles,
+            built.has_deferred ? &built.deferred_negatives : nullptr);
     });
     // The grounded model and the Datalog program are only needed through
     // instantiation. Release them now (they can be hundreds of MB on large

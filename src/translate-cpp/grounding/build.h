@@ -23,6 +23,15 @@ namespace translate::grounding {
 struct BuiltProgram {
     Program program;
     Program deferred_actions;
+    // Negated static precondition atoms per deferred action-head predicate
+    // id, args resolved to parameter positions (constants stay symbols). A
+    // ground action whose parameter binding satisfies such an atom
+    // positively is inapplicable in every state (static truth is
+    // state-independent); instantiate uses these to skip the full
+    // instantiation of such actions with one probe, while still recording
+    // their parameters for the invariant finder (whose search must see the
+    // same reachable-parameter sets as the Python translator).
+    std::unordered_map<int, std::vector<Atom>> deferred_negatives;
     bool has_deferred = false;
 };
 

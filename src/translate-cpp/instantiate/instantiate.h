@@ -43,10 +43,19 @@ struct Result {
 /*
   Walk the Datalog model and produce instantiated actions, axioms, and
   goal. The task must be normalized.
+
+  `negated_statics` (optional; from deferred action grounding) maps an
+  action predicate id to negated static precondition atoms whose args are
+  parameter positions or constant symbols. Action atoms satisfying one
+  positively are statically inapplicable: their parameters are still
+  recorded (the invariant finder must see the same reachable-parameter
+  sets either way) but their instantiation is skipped.
 */
 Result instantiate(
     const pddl::Task &task, const std::vector<grounding::Atom> &model,
-    const grounding::PredicateRoles &roles);
+    const grounding::PredicateRoles &roles,
+    const std::unordered_map<int, std::vector<grounding::Atom>>
+        *negated_statics = nullptr);
 }
 
 #endif

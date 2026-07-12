@@ -94,6 +94,53 @@ vector<Atom> condition_to_rule_body(
 }
 
 /*
+  Collect the negated static atoms of a normalized precondition whose
+  arguments are all action parameters or constants, with parameter args
+  resolved to their positions (position Args index the deferred head, whose
+  args are exactly the parameters in order). Fluent predicates are excluded:
+  only static truth is state-independent, so only static atoms may prune
+  ground actions.
+*/
+void collect_negated_statics(
+    const ConditionPtr &condition, const unordered_set<int> &fluents,
+    const unordered_map<string, int> &param_index, vector<Atom> &out) {
+    if (!condition)
+        return;
+    switch (condition->kind()) {
+    case Condition::Kind::EXISTENTIAL:
+        if (!condition->parts().empty())
+            collect_negated_statics(
+                condition->parts()[0], fluents, param_index, out);
+        return;
+    case Condition::Kind::CONJUNCTION:
+        for (const auto &part : condition->parts())
+            collect_negated_statics(part, fluents, param_index, out);
+        return;
+    case Condition::Kind::NEGATED_ATOM: {
+        const auto &lit = static_cast<const Literal &>(*condition);
+        ArgList args;
+        args.reserve(lit.args.size());
+        for (const auto &a : lit.args) {
+            if (!a.empty() && a.front() == '?') {
+                auto it = param_index.find(a);
+                if (it == param_index.end())
+                    return; // bound by an existential: cannot post-filter
+                args.emplace_back(Arg(it->second));
+            } else {
+                args.emplace_back(a);
+            }
+        }
+        Atom atom(lit.predicate, move(args));
+        if (!fluents.contains(atom.predicate))
+            out.push_back(move(atom));
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+/*
   Datalog head predicate names. Python uses the Action/Axiom object as
   the predicate; in C++ we encode the (action/axiom) index so the
   instantiate pass can map back to the source action/axiom even when
@@ -176,7 +223,19 @@ void translate_facts(Program &prog, const Task &task) {
     }
 }
 
-void build_exploration_rules(Program &prog, const Task &task, Program *deferred) {
+void build_exploration_rules(
+    Program &prog, const Task &task, Program *deferred,
+    unordered_map<int, vector<Atom>> *negatives) {
+    unordered_set<int> fluents;
+    if (deferred) {
+        for (const auto &a : task.actions)
+            for (const auto &eff : a.effects)
+                if (eff.literal)
+                    fluents.insert(symbols().intern(
+                        static_cast<const Literal &>(*eff.literal).predicate));
+        for (const auto &x : task.axioms)
+            fluents.insert(symbols().intern(x.name));
+    }
     for (size_t i = 0; i < task.actions.size(); ++i) {
         const Action &action = task.actions[i];
         Atom head = action_head(action, static_cast<int>(i));
@@ -194,7 +253,18 @@ void build_exploration_rules(Program &prog, const Task &task, Program *deferred)
         if (deferred) {
             deferred->predicate_roles.set(
                 head.predicate, PredicateRole::ACTION, static_cast<int>(i));
-            deferred->add_rule(Rule{body, head});
+            const Atom &deferred_head = head;
+            unordered_map<string, int> param_index;
+            for (size_t k = 0; k < action.parameters.size(); ++k)
+                param_index[action.parameters[k].name] = static_cast<int>(k);
+            vector<Atom> negs;
+            collect_negated_statics(
+                action.precondition, fluents, param_index, negs);
+            if (!negs.empty())
+                (*negatives)[deferred_head.predicate] = move(negs);
+            // Parameters precede any existential-witness variables in the
+            // head, so the filters' position args stay valid.
+            deferred->add_rule(Rule{body, deferred_head});
         } else {
             prog.add_rule(Rule{body, head});
         }
@@ -258,7 +328,8 @@ BuiltProgram build_program(const Task &task) {
     cout << "Generating Datalog program..." << endl;
     translate_facts(prog, task);
     build_exploration_rules(
-        prog, task, out.has_deferred ? &out.deferred_actions : nullptr);
+        prog, task, out.has_deferred ? &out.deferred_actions : nullptr,
+        out.has_deferred ? &out.deferred_negatives : nullptr);
     cout << "Normalizing Datalog program..." << endl;
     prog.normalize();
     return out;
