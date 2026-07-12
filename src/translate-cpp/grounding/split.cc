@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstddef>
+#include <iostream>
 #include <map>
 #include <string>
 #include <tuple>
@@ -205,6 +206,89 @@ vector<Rule> split_into_binary_rules(Rule rule, Program &prog) {
     return greedy_join(rule, prog);
 }
 
+/*
+  Append a canonical encoding of `atom` to `key`: variables are numbered by
+  first occurrence (negative codes), constants keep their symbol id. Two
+  rules get equal keys iff they are identical up to variable renaming.
+*/
+void append_canonical(
+    const Atom &atom, bool include_predicate, unordered_map<int, int> &var_ids,
+    vector<int> &key) {
+    if (include_predicate)
+        key.push_back(atom.predicate);
+    key.push_back(static_cast<int>(atom.args.size()));
+    for (const auto &a : atom.args) {
+        bool is_var = false;
+        if (a.is_symbol()) {
+            const string &s = a.name();
+            is_var = !s.empty() && s.front() == '?';
+        }
+        if (is_var) {
+            auto [it, _] =
+                var_ids.emplace(a.v, static_cast<int>(var_ids.size()));
+            key.push_back(-1 - it->second);
+        } else {
+            key.push_back(a.v);
+        }
+    }
+}
+
+/*
+  Merge auxiliary (p$) rules whose bodies are identical up to variable
+  renaming. Rules that share join subexpressions arise routinely once
+  effect rules carry their action's precondition body (deferred action
+  grounding): every effect of a schema re-splits the same precondition,
+  so whole join subtrees repeat per effect and across schemas. Every p$
+  predicate has exactly one producing rule, so dropping a duplicate and
+  rewriting its consumers to the surviving predicate preserves the
+  model. Iterated to a fixpoint: a rewrite can make more rules identical.
+*/
+void merge_duplicate_rules(Program &prog) {
+    size_t merged = 0;
+    for (;;) {
+        map<vector<int>, int> canon_to_head;
+        unordered_map<int, int> replace;
+        vector<char> drop(prog.rules.size(), 0);
+        for (size_t i = 0; i < prog.rules.size(); ++i) {
+            const Rule &r = prog.rules[i];
+            const string &head = symbols().name(r.effect.predicate);
+            if (head.rfind("p$", 0) != 0)
+                continue;
+            vector<int> key;
+            unordered_map<int, int> var_ids;
+            append_canonical(r.effect, false, var_ids, key);
+            key.push_back(static_cast<int>(r.conditions.size()));
+            for (const auto &c : r.conditions)
+                append_canonical(c, true, var_ids, key);
+            auto [it, inserted] =
+                canon_to_head.emplace(move(key), r.effect.predicate);
+            if (!inserted && it->second != r.effect.predicate) {
+                replace[r.effect.predicate] = it->second;
+                drop[i] = 1;
+            }
+        }
+        if (replace.empty())
+            break;
+        merged += replace.size();
+        vector<Rule> kept;
+        kept.reserve(prog.rules.size());
+        for (size_t i = 0; i < prog.rules.size(); ++i) {
+            if (drop[i])
+                continue;
+            Rule &r = prog.rules[i];
+            for (auto &c : r.conditions) {
+                auto it = replace.find(c.predicate);
+                if (it != replace.end())
+                    c.predicate = it->second;
+            }
+            kept.push_back(move(r));
+        }
+        prog.rules = move(kept);
+    }
+    if (merged > 0)
+        cout << "Merged " << merged << " duplicate rules." << endl;
+}
+
 vector<Rule> split_rule(const Rule &rule, Program &prog) {
     vector<Atom> important, trivial;
     for (const auto &c : rule.conditions) {
@@ -256,5 +340,6 @@ void split_rules(Program &prog) {
             new_rules.push_back(move(nr));
     }
     prog.rules = move(new_rules);
+    merge_duplicate_rules(prog);
 }
 }
