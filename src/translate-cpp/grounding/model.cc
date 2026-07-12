@@ -520,7 +520,7 @@ public:
 
 }
 
-vector<Atom> compute_model(const Program &prog) {
+vector<Atom> compute_model(Program &prog, bool sort_facts) {
     cout << "Preparing model..." << endl;
     auto rules = convert_rules(prog);
     Unifier unifier;
@@ -531,8 +531,9 @@ vector<Atom> compute_model(const Program &prog) {
                 rules[i]->conditions[k]);
         }
     }
-    vector<Atom> fact_atoms = prog.facts;
-    sort(fact_atoms.begin(), fact_atoms.end());
+    vector<Atom> fact_atoms = move(prog.facts);
+    if (sort_facts)
+        sort(fact_atoms.begin(), fact_atoms.end());
     AtomQueue queue(move(fact_atoms));
 
     cout << "Generated " << rules.size() << " rules." << endl;

@@ -288,7 +288,7 @@ void ground_deferred_actions(
     // order.
     ExtensionStats stats = ExtensionStats::of(deferred.facts);
     split_rules(deferred, &stats);
-    auto action_model = compute_model(deferred);
+    auto action_model = compute_model(deferred, /*sort_facts=*/false);
     // Precompute action predicates by id; split_rules interned fresh aux
     // names, so re-size against the current symbol table.
     vector<char> is_action(symbols().size(), 0);

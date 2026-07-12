@@ -13,7 +13,14 @@ namespace translate::grounding {
   The program must have been split (split_rules()) so that each rule has
   a kind of JOIN, PRODUCT, or PROJECT.
 */
-std::vector<Atom> compute_model(const Program &prog);
+/*
+  Compute the canonical model. Consumes prog.facts (moved into the queue).
+  `sort_facts` keeps the initial facts in Python's name-sorted order, which
+  fixes the derivation order the Python translator produces; pass false
+  when the caller does not need that order (deferred action grounding),
+  saving a string-comparison sort over the complete seeded model.
+*/
+std::vector<Atom> compute_model(Program &prog, bool sort_facts = true);
 }
 
 #endif
