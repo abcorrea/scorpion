@@ -264,9 +264,15 @@ bool add_positive_conditions(
             if (cit != condition.end()) {
                 if (!value_set_contains(cit->second, val))
                     return false;
-                cit->second = {val};
+                // Pin the domain to {val} without constructing a temporary
+                // set; a single-element domain that passed the containment
+                // check already is {val}.
+                if (cit->second.size() > 1) {
+                    cit->second.clear();
+                    cit->second.push_back(val);
+                }
             } else {
-                condition[var] = {val};
+                condition[var].push_back(val);
             }
         }
     }
