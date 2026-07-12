@@ -666,6 +666,107 @@ optional<SASOperator> translate_strips_operator_aux(
         implied_facts);
 }
 
+/*
+  Fast path for plain STRIPS operators: a single precondition assignment,
+  every effect unconditional, every effect fact with at most one (var, val)
+  representation, and default flags. Under those premises the general
+  machinery (per-effect condition translation, the nested per-operator
+  effect maps, shared del-guard maps, and the none-of-those negation)
+  reduces to the rules below, whose outputs the general path would produce
+  verbatim after its final sort + unique canonicalization:
+
+  - add (var, post): skipped if the precondition pins var to post; else
+    pre_post (var, pre-or--1, post, {}).
+  - del (var, val) with any add on var: no entry (the "no add fires"
+    disjunction is unsatisfiable for unconditional adds).
+  - del (var, val), no add on var, none = ranges[var] - 1:
+      precondition pins var to val   -> (var, val, none, {})
+      precondition pins var elsewhere-> contradiction, no entry
+      var unconstrained, binary var  -> (var, -1, none, {})   [guard pruned]
+      var unconstrained otherwise    -> (var, -1, none, {(var, val)})
+  - prevail: precondition entries for variables without a kept effect.
+*/
+optional<SASOperator> translate_strips_operator_fast(
+    const PropositionalAction &op, const FactToVarVals &factvals,
+    const vector<int> &ranges, const VarMap &condition) {
+    vector<PrePost> pre_post;
+    // (var, del value) of del effects; adds recorded first to resolve the
+    // "any add on var" rule without a map.
+    small_vector::SmallVector<int, 8> add_vars;
+    for (const auto &[conds, fact] : op.add_effects) {
+        const auto &varvals = factvals[fact.fact];
+        if (varvals.empty())
+            continue;
+        const auto &[var, post] = varvals[0];
+        add_vars.push_back(var);
+        auto cit = condition.find(var);
+        int pre = cit == condition.end() ? -1 : cit->second;
+        if (pre == post)
+            continue;
+        pre_post.emplace_back(var, pre, post, vector<VarVal>{});
+    }
+    for (const auto &[conds, fact] : op.del_effects) {
+        const auto &varvals = factvals[fact.fact];
+        if (varvals.empty())
+            continue;
+        const auto &[var, val] = varvals[0];
+        bool has_add = false;
+        for (int av : add_vars)
+            if (av == var) {
+                has_add = true;
+                break;
+            }
+        if (has_add)
+            continue;
+        int none_of_those = ranges[var] - 1;
+        auto cit = condition.find(var);
+        if (cit != condition.end()) {
+            if (cit->second != val || cit->second == none_of_those)
+                continue;
+            pre_post.emplace_back(var, val, none_of_those, vector<VarVal>{});
+        } else if (ranges[var] == 2) {
+            pre_post.emplace_back(var, -1, none_of_those, vector<VarVal>{});
+        } else {
+            pre_post.emplace_back(
+                var, -1, none_of_those, vector<VarVal>{{var, val}});
+        }
+    }
+    if (pre_post.empty() && !get_options().keep_no_ops)
+        return nullopt;
+    ranges::sort(pre_post);
+    pre_post.erase(unique(pre_post.begin(), pre_post.end()), pre_post.end());
+    SASOperator out;
+    out.name = op.name;
+    for (const auto &[var, val] : condition) {
+        bool affected = false;
+        for (const auto &pp : pre_post)
+            if (pp.var == var) {
+                affected = true;
+                break;
+            }
+        if (!affected)
+            out.prevail.emplace_back(var, val);
+    }
+    ranges::sort(out.prevail);
+    out.pre_post = move(pre_post);
+    out.cost = op.cost;
+    return out;
+}
+
+bool fast_translatable(
+    const PropositionalAction &op, const FactToVarVals &factvals) {
+    if (get_options().add_implied_preconditions ||
+        !get_options().use_partial_encoding)
+        return false;
+    for (const auto &[conds, fact] : op.add_effects)
+        if (!conds.empty() || factvals[fact.fact].size() > 1)
+            return false;
+    for (const auto &[conds, fact] : op.del_effects)
+        if (!conds.empty() || factvals[fact.fact].size() > 1)
+            return false;
+    return true;
+}
+
 vector<SASOperator> translate_strips_operator(
     const PropositionalAction &op, const FactToVarVals &factvals,
     const vector<int> &ranges, const FactToVarVals &mutex_factvals,
@@ -675,6 +776,13 @@ vector<SASOperator> translate_strips_operator(
         op.precondition, factvals, ranges, mutex_factvals, mutex_ranges);
     if (!conds)
         return result;
+    if (conds->size() == 1 && fast_translatable(op, factvals)) {
+        auto op_out = translate_strips_operator_fast(
+            op, factvals, ranges, (*conds)[0]);
+        if (op_out)
+            result.push_back(move(*op_out));
+        return result;
+    }
     for (const auto &c : *conds) {
         auto op_out = translate_strips_operator_aux(
             op, factvals, ranges, mutex_factvals, mutex_ranges, c,
