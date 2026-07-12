@@ -7,6 +7,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -287,31 +288,59 @@ public:
     array<unordered_map<JoinKey, vector<int>, JoinKeyHash>, 2> atoms_by_key;
 
     JoinRuleB(Atom e, vector<Atom> c) : BuildRule(move(e), move(c)) {
-        const auto &la = conditions[0].args;
-        const auto &ra = conditions[1].args;
-        vector<int> lvars, rvars;
-        for (const auto &a : la)
+        /*
+          The join key must cover EVERY variable the two conditions share:
+          effect variables (rewritten to positions by variables_to_numbers)
+          and variables the splitter projected away, which remain as
+          ?-symbols. Ignoring the latter would degrade the join into a cross
+          product -- unsound. Eager exploration programs never exhibit dead
+          join variables (action heads carry all precondition variables),
+          but deferred-action-grounding effect rules routinely do.
+
+          A variable is encoded as a token: position p -> (0, p), ?-symbol
+          id v -> (1, v); constants get no token. Tokens are matched across
+          the two sides and keyed in sorted order (positions first,
+          ascending), which reproduces the previous key order for
+          position-only rules.
+        */
+        using Token = pair<int, int>;
+        auto var_token = [](const Arg &a) -> optional<Token> {
             if (a.is_position())
-                lvars.push_back(a.position());
-        for (const auto &a : ra)
-            if (a.is_position())
-                rvars.push_back(a.position());
-        ranges::sort(lvars);
-        ranges::sort(rvars);
-        vector<int> common;
-        set_intersection(
-            lvars.begin(), lvars.end(), rvars.begin(), rvars.end(),
-            back_inserter(common));
-        for (int side = 0; side < 2; ++side) {
-            const auto &args = conditions[side].args;
-            for (int var : common) {
-                for (size_t i = 0; i < args.size(); ++i) {
-                    if (args[i].is_position() && args[i].position() == var) {
-                        common_positions[side].push_back(static_cast<int>(i));
-                        break;
-                    }
+                return Token{0, a.position()};
+            if (a.is_symbol()) {
+                const string &s = a.name();
+                if (!s.empty() && s.front() == '?')
+                    return Token{1, a.v};
+            }
+            return nullopt;
+        };
+        auto tokens_of = [&](const Atom &cond) {
+            vector<pair<Token, int>> out; // (token, first arg index)
+            for (size_t i = 0; i < cond.args.size(); ++i) {
+                if (auto t = var_token(cond.args[i])) {
+                    bool seen = false;
+                    for (const auto &[tok, _] : out)
+                        if (tok == *t) {
+                            seen = true;
+                            break;
+                        }
+                    if (!seen)
+                        out.emplace_back(*t, static_cast<int>(i));
                 }
             }
+            return out;
+        };
+        auto ltok = tokens_of(conditions[0]);
+        auto rtok = tokens_of(conditions[1]);
+        vector<pair<Token, pair<int, int>>> common; // token -> (lpos, rpos)
+        for (const auto &[lt, li] : ltok)
+            for (const auto &[rt, ri] : rtok)
+                if (lt == rt)
+                    common.emplace_back(lt, make_pair(li, ri));
+        ranges::sort(common);
+        for (const auto &[tok, pos] : common) {
+            common_positions[0].push_back(pos.first);
+            common_positions[1].push_back(pos.second);
         }
     }
 
