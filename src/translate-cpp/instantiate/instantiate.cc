@@ -313,19 +313,28 @@ CompiledLiteral compile_literal(
 
 // Flatten `cond` into literals (in tree order, matching the instantiate()
 // walk). Returns false on a shape the compiler does not handle.
+// With `fluent_preds` set (deferred action grounding only), positive
+// literals over non-fluent (static) predicates are omitted: the ground
+// action was derived by joining exactly those relations, so the probe
+// cannot fail, and a satisfied static literal contributes no
+// GroundLiteral anyway.
 bool compile_condition(
     const ConditionPtr &cond, const vector<TypedObject> &action_params,
-    const vector<TypedObject> *eff_params, vector<CompiledLiteral> &out) {
+    const vector<TypedObject> *eff_params, vector<CompiledLiteral> &out,
+    const unordered_set<int> *fluent_preds = nullptr) {
     if (!cond)
         return true;
     switch (cond->kind()) {
     case Condition::Kind::TRUTH:
         return true;
-    case Condition::Kind::ATOM:
-        out.push_back(compile_literal(
-            static_cast<const Literal &>(*cond), false, action_params,
-            eff_params));
+    case Condition::Kind::ATOM: {
+        const auto &lit = static_cast<const Literal &>(*cond);
+        if (fluent_preds && !fluent_preds->contains(lit.predicate_id))
+            return true;
+        out.push_back(
+            compile_literal(lit, false, action_params, eff_params));
         return true;
+    }
     case Condition::Kind::NEGATED_ATOM:
         out.push_back(compile_literal(
             static_cast<const Literal &>(*cond), true, action_params,
@@ -333,7 +342,8 @@ bool compile_condition(
         return true;
     case Condition::Kind::CONJUNCTION:
         for (const auto &c : cond->parts())
-            if (c && !compile_condition(c, action_params, eff_params, out))
+            if (c && !compile_condition(
+                          c, action_params, eff_params, out, fluent_preds))
                 return false;
         return true;
     case Condition::Kind::EXISTENTIAL:
@@ -341,7 +351,8 @@ bool compile_condition(
         // walked; the quantified parameters get no bindings of their own.
         return cond->parts().empty() ||
                compile_condition(
-                   cond->parts()[0], action_params, eff_params, out);
+                   cond->parts()[0], action_params, eff_params, out,
+                   fluent_preds);
     default:
         return false;
     }
@@ -349,10 +360,12 @@ bool compile_condition(
 
 CompiledAction compile_action(
     const Action &action,
-    const unordered_map<string, vector<int>> &objects_by_type) {
+    const unordered_map<string, vector<int>> &objects_by_type,
+    const unordered_set<int> *fluent_preds_if_deferred) {
     CompiledAction ca;
     if (!compile_condition(
-            action.precondition, action.parameters, nullptr, ca.precondition))
+            action.precondition, action.parameters, nullptr, ca.precondition,
+            fluent_preds_if_deferred))
         return ca;
     size_t max_eff_params = 0;
     for (const auto &eff : action.effects) {
@@ -688,7 +701,9 @@ Result instantiate(
     vector<CompiledAction> compiled_actions;
     compiled_actions.reserve(task.actions.size());
     for (const auto &action : task.actions)
-        compiled_actions.push_back(compile_action(action, objects_by_type));
+        compiled_actions.push_back(compile_action(
+            action, objects_by_type,
+            negated_statics ? &fluent_preds : nullptr));
 
     for (const auto &atom : model) {
         switch (roles.role_of(atom.predicate)) {
