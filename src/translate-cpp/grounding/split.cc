@@ -183,49 +183,35 @@ vector<Rule> greedy_join(
         for (const auto &c : joinees)
             jstats.push_back(base_stats(c, *stats));
     }
-    // Index of the current intermediate (size-aware mode), -1 before the
-    // first join.
-    int cur = -1;
-
     vector<Rule> result;
     while (joinees.size() >= 2) {
         size_t bi = 0, bj = 0;
         JoineeStats next_stats;
         if (stats) {
             /*
-              Left-deep, estimate-driven order: the anchor is the smallest
-              relation (first round) or the running intermediate; the
-              partner minimizes the estimated join size, cross products
-              included -- joining a selective one-tuple relation "across"
-              is often the best move (e.g. at_lander in Rovers' communicate
-              schemas), and forbidding it forces fanout joins that
-              materialize millions of tuples. Ties break on the lower
-              index (deterministic).
+              Bushy, estimate-driven order: join the globally cheapest pair
+              by estimated result size, cross products included. This lets
+              selective one-tuple relations combine "across" (at_lander in
+              Rovers' communicate schemas) and lets type filters pre-reduce
+              base relations BEFORE a fanout join -- a left-deep chain
+              would re-materialize the full output once per trailing
+              filter (logistics' drive-truck: 3 x 2M tuples). Ties break
+              on the lower pair indices (deterministic).
             */
-            size_t anchor;
-            if (cur >= 0) {
-                anchor = static_cast<size_t>(cur);
-            } else {
-                anchor = 0;
-                for (size_t i = 1; i < joinees.size(); ++i)
-                    if (jstats[i].est < jstats[anchor].est)
-                        anchor = i;
-            }
-            size_t partner = joinees.size();
             double best_est = 0.0;
-            for (size_t i = 0; i < joinees.size(); ++i) {
-                if (i == anchor)
-                    continue;
-                double e = estimate_join(jstats[anchor], jstats[i]);
-                if (partner == joinees.size() || e < best_est) {
-                    partner = i;
-                    best_est = e;
+            bool have = false;
+            for (size_t j = 1; j < joinees.size(); ++j) {
+                for (size_t i = 0; i < j; ++i) {
+                    double e = estimate_join(jstats[i], jstats[j]);
+                    if (!have || e < best_est) {
+                        have = true;
+                        best_est = e;
+                        bi = j;
+                        bj = i;
+                    }
                 }
             }
-            next_stats =
-                join_stats(jstats[anchor], jstats[partner], best_est);
-            bi = max(anchor, partner);
-            bj = min(anchor, partner);
+            next_stats = join_stats(jstats[bj], jstats[bi], best_est);
         } else {
             // Find min-cost pair.
             Cost best{INT_MAX, INT_MAX, INT_MAX};
@@ -300,10 +286,8 @@ vector<Rule> greedy_join(
         result.push_back(join_rule);
         joinees.push_back(join_effect);
         occ.update(join_effect, +1);
-        if (stats) {
+        if (stats)
             jstats.push_back(move(next_stats));
-            cur = static_cast<int>(joinees.size()) - 1;
-        }
     }
     // Final result rule: replace last result's effect with the rule's
     // original effect.
