@@ -53,20 +53,30 @@ public:
         vector<vector<int>> raw_targets(num_variables);
         weight_from_ops(task.operators, raw_targets);
         weight_from_axioms(task.axioms, raw_targets);
+        vector<int> count(num_variables, 0);
         for (int src = 0; src < num_variables; ++src)
-            weighted_graph[src] = reduce_to_weighted(move(raw_targets[src]));
+            weighted_graph[src] =
+                reduce_to_weighted(move(raw_targets[src]), count);
         build_predecessor_graph();
     }
 
-    // Sort target occurrences and run-length-reduce them to (tgt, weight).
-    static vector<pair<int, int>> reduce_to_weighted(vector<int> targets) {
-        ranges::sort(targets);
+    // Count target occurrences and reduce them to (tgt, weight), sorted by
+    // tgt. Counting and sorting only the distinct targets beats sorting the
+    // raw occurrence list, which holds one entry per operator-effect edge
+    // and dominated the profile on operator-heavy tasks (caldera-large).
+    // `count` is caller-owned all-zeros scratch; it is re-zeroed on return.
+    static vector<pair<int, int>> reduce_to_weighted(
+        vector<int> targets, vector<int> &count) {
+        vector<int> distinct;
+        for (int tgt : targets)
+            if (count[tgt]++ == 0)
+                distinct.push_back(tgt);
+        ranges::sort(distinct);
         vector<pair<int, int>> weighted;
-        for (int tgt : targets) {
-            if (!weighted.empty() && weighted.back().first == tgt)
-                ++weighted.back().second;
-            else
-                weighted.emplace_back(tgt, 1);
+        weighted.reserve(distinct.size());
+        for (int tgt : distinct) {
+            weighted.emplace_back(tgt, count[tgt]);
+            count[tgt] = 0;
         }
         return weighted;
     }
