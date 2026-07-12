@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cstdint>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -96,38 +97,43 @@ public:
         if (cap_ == 0 || (count_ + 1) * 10 > cap_ * 7) // keep load factor < 0.7
             grow();
         size_t mask = cap_ - 1;
-        size_t h = (*hashes_)[idx] & mask;
-        while (slots_[h] != EMPTY) {
-            int other = slots_[h];
-            if ((*hashes_)[other] == (*hashes_)[idx] &&
-                (*items_)[other] == (*items_)[idx])
+        uint32_t h32 = (*hashes_)[idx];
+        size_t h = h32 & mask;
+        for (uint64_t slot; (slot = slots_[h]) != 0; h = (h + 1) & mask) {
+            // The stored hash rides in the slot, so a mismatch (the common
+            // collision case) resolves on this cache line without a
+            // dependent load from the hashes array.
+            if (static_cast<uint32_t>(slot >> 32) == h32 &&
+                (*items_)[static_cast<int>(slot & 0xffffffff) - 1] ==
+                    (*items_)[idx])
                 return false;
-            h = (h + 1) & mask;
         }
-        slots_[h] = idx;
+        slots_[h] =
+            (static_cast<uint64_t>(h32) << 32) | static_cast<uint32_t>(idx + 1);
         ++count_;
         return true;
     }
 
 private:
-    static constexpr int EMPTY = -1;
+    // A slot packs the atom's 32-bit mixed hash (high) and index + 1 (low);
+    // 0 marks an empty slot (index + 1 is never 0).
     const vector<Atom> *items_;
     const vector<uint32_t> *hashes_;
-    vector<int> slots_;
+    vector<uint64_t> slots_;
     size_t cap_ = 0;
     size_t count_ = 0;
 
     void grow() {
         size_t new_cap = cap_ ? cap_ * 2 : (size_t{1} << 16);
-        vector<int> new_slots(new_cap, EMPTY);
+        vector<uint64_t> new_slots(new_cap, 0);
         size_t mask = new_cap - 1;
-        for (int idx : slots_) {
-            if (idx == EMPTY)
+        for (uint64_t slot : slots_) {
+            if (slot == 0)
                 continue;
-            size_t h = (*hashes_)[idx] & mask;
-            while (new_slots[h] != EMPTY)
+            size_t h = static_cast<uint32_t>(slot >> 32) & mask;
+            while (new_slots[h] != 0)
                 h = (h + 1) & mask;
-            new_slots[h] = idx;
+            new_slots[h] = slot;
         }
         slots_.swap(new_slots);
         cap_ = new_cap;
