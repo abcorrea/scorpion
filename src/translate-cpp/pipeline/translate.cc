@@ -62,6 +62,18 @@ FactId fact_id_of(const Literal &lit, const FactMap &ids) {
 // per-literal string key.
 using FactToVarVals = vector<vector<VarVal>>;
 
+// FactId of a fluent atom by object identity. Fact-group and mutex-group
+// members are the same shared Atom objects as the fluent-fact set
+// (fact_groups keys its own per-atom ids by pointer), so the dictionary
+// passes below resolve them with one pointer hash instead of re-interning
+// every argument string per atom.
+using FactIdByPtr = unordered_map<const Condition *, FactId>;
+
+FactId fact_id_of(const Condition *atom, const FactIdByPtr &ids) {
+    auto it = ids.find(atom);
+    return it == ids.end() ? -1 : it->second;
+}
+
 struct StripsToSas {
     vector<int> ranges;
     FactToVarVals factvals;
@@ -69,14 +81,13 @@ struct StripsToSas {
 
 StripsToSas build_dictionary(
     const vector<vector<ConditionPtr>> &groups, size_t num_facts,
-    const FactMap &fluent_ids, bool assert_partial) {
+    const FactIdByPtr &fact_ids, bool assert_partial) {
     StripsToSas out;
     out.factvals.resize(num_facts);
     out.ranges.reserve(groups.size());
     for (size_t var = 0; var < groups.size(); ++var) {
         for (size_t val = 0; val < groups[var].size(); ++val) {
-            const auto &atom = static_cast<const Atom &>(*groups[var][val]);
-            FactId f = fact_id_of(atom, fluent_ids);
+            FactId f = fact_id_of(groups[var][val].get(), fact_ids);
             if (f >= 0)
                 out.factvals[f].push_back(
                     {static_cast<int>(var), static_cast<int>(val)});
@@ -105,15 +116,13 @@ using ImpliedFacts = map<VarVal, vector<VarVal>>;
 */
 ImpliedFacts build_implied_facts(
     const fact_groups::ComputedGroups &groups, const StripsToSas &strips_to_sas,
-    const FactMap &fluent_ids) {
+    const FactIdByPtr &fact_ids) {
     // Lonely propositions: size-1 fact groups -> their SAS variable number
     // (the proposition is encoded as (var, 0); see build_dictionary).
     unordered_map<FactId, int> lonely;
     for (size_t var = 0; var < groups.groups.size(); ++var) {
         if (groups.groups[var].size() == 1) {
-            const auto &prop =
-                static_cast<const Atom &>(*groups.groups[var][0]);
-            FactId f = fact_id_of(prop, fluent_ids);
+            FactId f = fact_id_of(groups.groups[var][0].get(), fact_ids);
             if (f >= 0)
                 lonely[f] = static_cast<int>(var);
         }
@@ -121,16 +130,14 @@ ImpliedFacts build_implied_facts(
     ImpliedFacts implied;
     for (const auto &mutex_group : groups.mutex_groups) {
         for (size_t i = 0; i < mutex_group.size(); ++i) {
-            const auto &prop = static_cast<const Atom &>(*mutex_group[i]);
-            auto lit = lonely.find(fact_id_of(prop, fluent_ids));
+            auto lit = lonely.find(fact_id_of(mutex_group[i].get(), fact_ids));
             if (lit == lonely.end())
                 continue;
             VarVal prop_is_false{lit->second, 1};
             for (size_t j = 0; j < mutex_group.size(); ++j) {
                 if (j == i)
                     continue;
-                const auto &other = static_cast<const Atom &>(*mutex_group[j]);
-                FactId f = fact_id_of(other, fluent_ids);
+                FactId f = fact_id_of(mutex_group[j].get(), fact_ids);
                 if (f < 0)
                     continue;
                 for (const auto &fact : strips_to_sas.factvals[f])
@@ -878,15 +885,21 @@ SASTask pddl_to_sas(Task &task) {
     bool use_partial = get_options().use_partial_encoding;
     const FactMap &fluent_ids = inst.fluent_fact_ids;
     size_t num_facts = inst.fact_by_id.size();
-    auto strips_to_sas =
-        build_dictionary(groups.groups, num_facts, fluent_ids, use_partial);
+    FactIdByPtr fact_id_by_ptr;
+    fact_id_by_ptr.reserve(num_facts);
+    for (size_t i = 0; i < num_facts; ++i)
+        fact_id_by_ptr.emplace(
+            inst.fact_by_id[i].get(), static_cast<FactId>(i));
+    auto strips_to_sas = build_dictionary(
+        groups.groups, num_facts, fact_id_by_ptr, use_partial);
     auto mutex_dict =
-        build_dictionary(groups.mutex_groups, num_facts, fluent_ids, false);
+        build_dictionary(groups.mutex_groups, num_facts, fact_id_by_ptr, false);
 
     // Facts implied by other facts (only used by --add-implied-preconditions).
     ImpliedFacts implied_facts;
     if (get_options().add_implied_preconditions)
-        implied_facts = build_implied_facts(groups, strips_to_sas, fluent_ids);
+        implied_facts =
+            build_implied_facts(groups, strips_to_sas, fact_id_by_ptr);
 
     // Build init.
     SASInit sas_init = build_sas_init(strips_to_sas, task, fluent_ids);
