@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 using namespace std;
@@ -17,19 +19,83 @@ int SASTask::remove_duplicate_operators() {
     // the prevail/pre_post entries kept in their current order. Operators are
     // already sorted by (name, prevail, pre_post), so among duplicates the
     // first-named one survives -- matching the Python translator.
+    //
+    // Most tasks have no duplicates at all, so the pass first computes a
+    // 64-bit fingerprint per operator in one streaming read (effect
+    // conditions are hashed commutatively, so the sorted-multiset key
+    // semantics hold without materializing sorted copies). Only operators
+    // sharing a fingerprint get the exact sorted-key comparison; a previous
+    // attempt that built exact keys for every operator lost to the old
+    // std::set (whose deep compares early-exit) on copy volume alone.
+    size_t n = operators.size();
+    auto mix = [](uint64_t h, uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    };
+    auto splitmix = [](uint64_t x) {
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    };
+    vector<uint64_t> fp(n);
+    for (size_t i = 0; i < n; ++i) {
+        const SASOperator &op = operators[i];
+        uint64_t h = splitmix(static_cast<uint64_t>(op.cost) + 1);
+        h = mix(h, op.prevail.size());
+        for (const auto &[var, val] : op.prevail)
+            h = mix(h, splitmix((static_cast<uint64_t>(var) << 32) |
+                                static_cast<uint32_t>(val)));
+        h = mix(h, op.pre_post.size());
+        for (const auto &[var, pre, post, cond] : op.pre_post) {
+            h = mix(h, splitmix(
+                            (static_cast<uint64_t>(var) << 42) ^
+                            (static_cast<uint64_t>(pre + 1) << 21) ^
+                            static_cast<uint64_t>(post + 1)));
+            uint64_t ch = 0;
+            for (const auto &[cv, cval] : cond)
+                ch += splitmix((static_cast<uint64_t>(cv) << 32) |
+                               static_cast<uint32_t>(cval));
+            h = mix(h, ch);
+            h = mix(h, cond.size());
+        }
+        fp[i] = h;
+    }
+    unordered_map<uint64_t, int> first_of;
+    first_of.reserve(n);
+    vector<char> maybe_dup(n, 0);
+    bool any_collision = false;
+    for (size_t i = 0; i < n; ++i) {
+        auto [it, inserted] = first_of.emplace(fp[i], static_cast<int>(i));
+        if (!inserted) {
+            maybe_dup[static_cast<size_t>(it->second)] = 1;
+            maybe_dup[i] = 1;
+            any_collision = true;
+        }
+    }
+    if (!any_collision)
+        return 0;
+    // Exact comparison for the (few) fingerprint-colliding operators.
     using Key = tuple<int, vector<VarVal>, vector<PrePost>>;
     set<Key> seen;
-    vector<SASOperator> unique;
-    unique.reserve(operators.size());
-    for (auto &op : operators) {
-        auto pre_post = op.pre_post;
+    vector<char> keep(n, 1);
+    for (size_t i = 0; i < n; ++i) {
+        if (!maybe_dup[i])
+            continue;
+        auto pre_post = operators[i].pre_post;
         for (auto &[var, pre, post, cond] : pre_post)
             ranges::sort(cond);
-        Key key{op.cost, op.prevail, move(pre_post)};
-        if (seen.insert(move(key)).second)
-            unique.push_back(move(op));
+        Key key{operators[i].cost, operators[i].prevail, move(pre_post)};
+        if (!seen.insert(move(key)).second)
+            keep[i] = 0;
     }
-    int removed = static_cast<int>(operators.size() - unique.size());
+    vector<SASOperator> unique;
+    unique.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        if (keep[i])
+            unique.push_back(move(operators[i]));
+    int removed = static_cast<int>(n - unique.size());
     operators = move(unique);
     return removed;
 }
