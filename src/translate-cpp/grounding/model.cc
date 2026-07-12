@@ -184,8 +184,11 @@ public:
         ++pushes; // count every push attempt, like Python's queue.push
         insert_if_new(Atom(pred, move(args)));
     }
-    Atom pop() {
-        return items[pos++];
+    // Advance past the front atom, returning its index. The caller reads the
+    // atom via items[index]; references into items are invalidated by push
+    // (reallocation), so re-index after any push instead of copying the atom.
+    int pop_index() {
+        return static_cast<int>(pos++);
     }
 };
 
@@ -217,6 +220,12 @@ public:
       loop -- an indirect std::function call per emission showed up as the
       top cost on model-heavy tasks). `items` is the model vector
       (`queue.items`), used to dereference stored atom indices.
+
+      ALIASING CONTRACT: `new_atom` aliases queue.items[atom_index] (the
+      caller avoids copying millions of atoms per model build), and
+      queue.push may reallocate queue.items. Implementations must therefore
+      finish reading `new_atom` (and any reference into `items`) before
+      their first queue.push, and re-index `items` after each push.
     */
     virtual void process(
         const Atom &new_atom, int atom_index, int cond_index,
@@ -504,17 +513,19 @@ vector<Atom> compute_model(const Program &prog) {
     size_t relevant = 0, auxiliary = 0;
     vector<pair<int, int>> matches;
     while (!queue.empty()) {
-        // Index of the atom in queue.items, captured before pop advances.
-        int idx = static_cast<int>(queue.pos);
-        Atom next = queue.pop();
-        if (is_auxiliary[next.predicate])
+        int idx = queue.pop_index();
+        // queue.items[idx] is re-indexed at each use instead of copied out:
+        // process() calls push into the queue, which can reallocate items,
+        // so a reference must be re-taken per call (see the aliasing
+        // contract on BuildRule::process).
+        if (is_auxiliary[queue.items[idx].predicate])
             ++auxiliary;
         else
             ++relevant;
         matches.clear();
-        unifier.unify(next, matches);
+        unifier.unify(queue.items[idx], matches);
         for (const auto &[ri, ci] : matches)
-            rules[ri]->process(next, idx, ci, queue.items, queue);
+            rules[ri]->process(queue.items[idx], idx, ci, queue.items, queue);
     }
     cout << relevant << " relevant atoms" << endl;
     cout << auxiliary << " auxiliary atoms" << endl;
