@@ -47,7 +47,7 @@ COLLECTIONS = [
 # modernize-translator branch starts from; "01-modernized" is its tip.
 REVISIONS = [
     ("00-base", "4fd73aea3"),
-    ("01-modernized", "5cf72e322"),
+    ("01-modernized", "d99d83aa3"),
 ]
 
 if project.REMOTE:
