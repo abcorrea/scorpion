@@ -250,7 +250,13 @@ void build_exploration_rules(
         }
         auto body =
             condition_to_rule_body(action.parameters, action.precondition, pne);
-        if (deferred) {
+        // Deferral only pays off for wide heads: with at most one argument
+        // there is no wide action atom to keep out of the fixpoint, and the
+        // second pass would re-run the same joins for nothing. Pre-ground
+        // inputs (airport declares 1,408 unary schemas per instance) stay
+        // entirely on the single-pass path this way.
+        bool defer_this = deferred && head.args.size() >= 2;
+        if (defer_this) {
             deferred->predicate_roles.set(
                 head.predicate, PredicateRole::ACTION, static_cast<int>(i));
             const Atom &deferred_head = head;
@@ -282,7 +288,7 @@ void build_exploration_rules(
             // project intermediates down to the effect's own variables
             // instead of dragging every action parameter to the wide head.
             vector<Atom> rule_body;
-            if (deferred)
+            if (defer_this)
                 rule_body = body;
             else
                 rule_body = {head};
@@ -323,13 +329,16 @@ void build_exploration_rules(
 
 BuiltProgram build_program(const Task &task) {
     BuiltProgram out;
-    out.has_deferred = get_options().defer_action_grounding;
+    bool allow_deferred = get_options().defer_action_grounding;
     Program &prog = out.program;
     cout << "Generating Datalog program..." << endl;
     translate_facts(prog, task);
     build_exploration_rules(
-        prog, task, out.has_deferred ? &out.deferred_actions : nullptr,
-        out.has_deferred ? &out.deferred_negatives : nullptr);
+        prog, task, allow_deferred ? &out.deferred_actions : nullptr,
+        allow_deferred ? &out.deferred_negatives : nullptr);
+    // Unary and nullary schemas stay on the single-pass path, so a task made
+    // up of them only (pre-ground input) skips the second pass entirely.
+    out.has_deferred = !out.deferred_actions.rules.empty();
     cout << "Normalizing Datalog program..." << endl;
     prog.normalize();
     return out;

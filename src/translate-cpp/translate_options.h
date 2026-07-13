@@ -27,9 +27,12 @@ struct Options {
     // directly, so rule splitting can project intermediates down to the
     // effect's variables) and recover the reachable ground actions in a
     // second pass against the completed model ("action predicate removal",
-    // Correa et al., ICAPS 2021). --eager-action-grounding restores the
-    // single-pass program, whose model order is byte-compatible with the
-    // Python translator.
+    // Correa et al., ICAPS 2021). Only schemas whose head has at least two
+    // arguments are deferred: narrower heads cannot profit, and pre-ground
+    // inputs (airport's per-instance domains declare over a thousand unary
+    // schemas) would pay the second pass for nothing.
+    // --eager-action-grounding grounds every schema in the single pass,
+    // whose model order is byte-compatible with the Python translator.
     bool defer_action_grounding = true;
 
     // Invariant generation.

@@ -15,10 +15,13 @@ namespace translate::grounding {
   called) but not yet split (split_rules() applies later).
 
   With options.defer_action_grounding (the default), the reachability
-  program contains no action-applicability atoms: each effect rule carries
-  the action's precondition body directly, and the applicability rules are
-  returned separately in `deferred_actions` for a second grounding pass
-  (ground_deferred_actions) once the model is complete.
+  program contains no wide action-applicability atoms: each effect rule
+  carries the action's precondition body directly, and the applicability
+  rules are returned separately in `deferred_actions` for a second grounding
+  pass (ground_deferred_actions) once the model is complete. Schemas whose
+  head has fewer than two arguments are grounded in the main pass regardless
+  (deferral cannot help them), so has_deferred is false for fully pre-ground
+  inputs and the second pass is skipped.
 */
 struct BuiltProgram {
     Program program;
