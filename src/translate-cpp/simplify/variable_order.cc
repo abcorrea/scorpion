@@ -301,13 +301,15 @@ public:
     }
 
     void apply(SASTask &task) const {
-        // Variables.
+        // Variables. `ordering` is a permutation (of a subset), so each
+        // source entry is gathered at most once and the value-name lists
+        // can be moved instead of deep-copied.
         vector<int> ranges, layers;
         vector<vector<string>> names;
         for (int var : ordering) {
             ranges.push_back(task.variables.ranges[var]);
             layers.push_back(task.variables.axiom_layers[var]);
-            names.push_back(task.variables.value_names[var]);
+            names.push_back(move(task.variables.value_names[var]));
         }
         task.variables.ranges = move(ranges);
         task.variables.axiom_layers = move(layers);
@@ -347,57 +349,65 @@ public:
         cout << new_mutexes.size() << " of " << task.mutexes.size()
              << " mutex groups necessary." << endl;
         task.mutexes = move(new_mutexes);
-        // Operators.
-        vector<SASOperator> new_ops;
-        for (auto &op : task.operators) {
-            vector<PrePost> new_pre_post;
-            for (auto &[v, pre, post, cond] : op.pre_post) {
-                auto it = new_var.find(v);
-                if (it == new_var.end())
-                    continue;
-                vector<VarVal> new_cond;
-                for (const auto &[cv, cval] : cond) {
-                    auto cit = new_var.find(cv);
-                    if (cit != new_var.end())
-                        new_cond.emplace_back(cit->second, cval);
-                }
-                new_pre_post.emplace_back(
-                    it->second, pre, post, move(new_cond));
-            }
-            if (new_pre_post.empty() && !get_options().keep_no_ops)
-                continue;
-            vector<VarVal> new_prevail;
-            for (const auto &[v, val] : op.prevail) {
+        // Operators. Remapped in place: every entry maps to the same or
+        // fewer entries with order preserved, so compact-in-place produces
+        // the exact sequence the old rebuild did while never holding a
+        // second operator vector (on 6M-operator tasks the rebuild's
+        // duplicate shells and fresh pre_post/cond buffers were the peak-RSS
+        // transient of the whole translation).
+        auto remap_varvals_in_place = [this](vector<VarVal> &pairs) {
+            size_t w = 0;
+            for (const auto &[v, val] : pairs) {
                 auto it = new_var.find(v);
                 if (it != new_var.end())
-                    new_prevail.emplace_back(it->second, val);
+                    pairs[w++] = {it->second, val};
             }
-            op.prevail = move(new_prevail);
-            op.pre_post = move(new_pre_post);
-            new_ops.push_back(move(op));
+            pairs.resize(w);
+        };
+        size_t num_ops_before = task.operators.size();
+        size_t wo = 0;
+        for (size_t i = 0; i < task.operators.size(); ++i) {
+            SASOperator &op = task.operators[i];
+            size_t wp = 0;
+            for (size_t j = 0; j < op.pre_post.size(); ++j) {
+                PrePost &pp = op.pre_post[j];
+                auto it = new_var.find(pp.var);
+                if (it == new_var.end())
+                    continue;
+                pp.var = it->second;
+                remap_varvals_in_place(pp.conditions);
+                if (wp != j)
+                    op.pre_post[wp] = move(pp);
+                ++wp;
+            }
+            op.pre_post.resize(wp);
+            if (op.pre_post.empty() && !get_options().keep_no_ops)
+                continue;
+            remap_varvals_in_place(op.prevail);
+            if (wo != i)
+                task.operators[wo] = move(op);
+            ++wo;
         }
-        cout << new_ops.size() << " of " << task.operators.size()
+        task.operators.resize(wo);
+        cout << task.operators.size() << " of " << num_ops_before
              << " operators necessary." << endl;
-        task.operators = move(new_ops);
-        // Axioms.
-        vector<SASAxiom> new_ax;
-        for (auto &ax : task.axioms) {
+        // Axioms, remapped in place like the operators.
+        size_t num_ax_before = task.axioms.size();
+        size_t wa = 0;
+        for (size_t i = 0; i < task.axioms.size(); ++i) {
+            SASAxiom &ax = task.axioms[i];
             auto it = new_var.find(ax.effect.first);
             if (it == new_var.end())
                 continue;
-            vector<VarVal> new_cond;
-            for (const auto &[v, val] : ax.condition) {
-                auto cit = new_var.find(v);
-                if (cit != new_var.end())
-                    new_cond.emplace_back(cit->second, val);
-            }
-            ax.condition = move(new_cond);
+            remap_varvals_in_place(ax.condition);
             ax.effect = {it->second, ax.effect.second};
-            new_ax.push_back(move(ax));
+            if (wa != i)
+                task.axioms[wa] = move(ax);
+            ++wa;
         }
-        cout << new_ax.size() << " of " << task.axioms.size()
+        task.axioms.resize(wa);
+        cout << task.axioms.size() << " of " << num_ax_before
              << " axiom rules necessary." << endl;
-        task.axioms = move(new_ax);
     }
 };
 }
