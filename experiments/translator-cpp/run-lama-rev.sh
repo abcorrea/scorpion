@@ -18,6 +18,7 @@ TRANSLATE="$1"; SEARCH="$2"; DOMAIN="$3"; PROBLEM="$4"
 # Leave margin under the experiment's 1800 s hard kill for logging.
 OVERALL=1770
 start=$(date +%s)
+start_hr=$(date +%s.%N)
 
 # lama-first, copied from driver/aliases.py and flattened to one line.
 LAMA_FIRST='let(hlm, landmark_sum(lm_factory=lm_reasonable_orders_hps(lm_rhw()),transform=adapt_costs(one),pref=false), let(hff, ff(transform=adapt_costs(one)), lazy_greedy([hff,hlm],preferred=[hff,hlm],cost_type=one,reopen_closed=false)))'
@@ -58,3 +59,6 @@ if [ -f output.sas ]; then
     fi
     rm -f output.sas
 fi
+
+# End-to-end wall time (translate + search + bookkeeping) for time scores.
+echo "OVERALL_WALL_TIME $(awk -v s="$start_hr" -v e="$(date +%s.%N)" 'BEGIN{printf "%.2f", e - s}')"

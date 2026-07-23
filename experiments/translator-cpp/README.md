@@ -14,6 +14,11 @@ in this directory instead of each carrying its own copy.
 - `run-translate.sh` — run one translator binary under `/usr/bin/time` (peak RSS).
 - `run-translate-cmp.sh` — run one translator via `fast-downward.py --translator`
   (py or cpp) and print the output.sas sha256 for byte-equivalence checks.
+- `run-translate-rev.sh` — run one cached per-revision `translate-cpp` binary
+  and print the output.sas sha256.
+- `run-lama-rev.sh` — translate with one revision's binary, then run a fixed
+  search binary with lama-first; one shared 30 min / 8 GiB budget, per-phase
+  `/usr/bin/time`, and the end-to-end wall time for agile scores.
 
 ## Experiments
 
@@ -26,6 +31,15 @@ in this directory instead of each carrying its own copy.
   and Autoscale-Sat, with per-task byte-equivalence.
 - `2026-07-05-D-ipc2023-learning.py` — py vs cpp over the IPC 2023 learning-track
   test set (10 domains x 90 tasks), with byte-equivalence.
+- `2026-07-12-E-base-vs-modernized.py` — translator-only A/B of the
+  modernize-translator branch point vs its tip (runtime, peak RSS,
+  byte-equivalence) over downward-benchmarks + htg-domains.
+- `2026-07-13-F-lama-first-coverage.py` — end-to-end lama-first coverage with
+  the same two revisions; translator and search share one 30 min / 8 GiB
+  budget.
+- `2026-07-23-G-lama-first-agile.py` — lama-first coverage and IPC agile score
+  across four translator generations: Python, the initial C++ port, Jendrik's
+  revised C++ translator, and the modernize-translator tip.
 
 ## Running
 
