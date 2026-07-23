@@ -1,7 +1,7 @@
 #!/bin/bash
 # Wrapper for end-to-end translator-revision comparisons.
 #
-# Args: TRANSLATE_BINARY SEARCH_BINARY DOMAIN_PDDL PROBLEM_PDDL
+# Args: TRANSLATE_BINARY SEARCH_BINARY DOMAIN_PDDL PROBLEM_PDDL [OVERALL_SECONDS]
 #
 # Translates the task with one revision's translate-cpp, then runs the fixed
 # search binary with the lama-first configuration on the result. Both phases
@@ -15,8 +15,9 @@ set -uo pipefail
 
 TRANSLATE="$1"; SEARCH="$2"; DOMAIN="$3"; PROBLEM="$4"
 
-# Leave margin under the experiment's 1800 s hard kill for logging.
-OVERALL=1770
+# Overall budget; callers pass their own. The default leaves margin under
+# experiment F's 1800 s hard kill for logging.
+OVERALL="${5:-1770}"
 start=$(date +%s)
 start_hr=$(date +%s.%N)
 

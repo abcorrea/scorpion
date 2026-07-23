@@ -3,9 +3,8 @@
 """
 Lama-first agile score across four translator generations.
 
-Each run translates AND searches under one competition-style budget
-(30 minutes, 8 GiB), like experiment F, but with four translators instead
-of two:
+Each run translates AND searches under the IPC agile track's budget
+(300 s, 8192 MiB), with four translators instead of two:
 
   00-python          the Python translator (src/translate). It is unchanged
                      from the C++ port's merge through our branch tip, so it
@@ -18,7 +17,7 @@ of two:
 
 The headline attribute is the IPC agile score on the end-to-end wall time t
 (translate + search, as printed by the wrapper): 0 if no plan was found,
-1 if t <= 1 s, else 1 - log(t)/log(1800). Coverage is reported alongside.
+1 if t <= 1 s, else 1 - log(t)/log(300). Coverage is reported alongside.
 
 All four algorithms share ONE search binary, so any difference comes from
 translation. Between 66a77f191 and our tip every src/ change is inside
@@ -67,8 +66,11 @@ REVISIONS = [
 # so reuse experiment F's cached search binary.
 SEARCH_REV = "d99d83aa3"
 
-# Overall per-run budget; also the upper bound of the agile score.
-TIME_LIMIT = 1800
+# Overall per-run budget (the IPC agile track limit); also the upper bound
+# of the agile score. The wrapper gets a slightly smaller internal budget so
+# its logging finishes under lab's hard kill.
+TIME_LIMIT = 300
+WRAPPER_BUDGET = TIME_LIMIT - 10
 
 if project.REMOTE:
     ENV = project.BaselSlurmEnvironment(
@@ -212,9 +214,9 @@ for prefix, env in COLLECTIONS:
             run.add_command(
                 "translate-and-search",
                 [WRAPPER, TRANSLATORS[nick], SEARCH_BINARY,
-                 task.domain_file, task.problem_file],
+                 task.domain_file, task.problem_file, str(WRAPPER_BUDGET)],
                 time_limit=TIME_LIMIT,
-                memory_limit=8000,
+                memory_limit=8192,
             )
             run.set_property("domain", domain)
             run.set_property("problem", task.problem)

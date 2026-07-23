@@ -17,8 +17,9 @@ in this directory instead of each carrying its own copy.
 - `run-translate-rev.sh` — run one cached per-revision `translate-cpp` binary
   and print the output.sas sha256.
 - `run-lama-rev.sh` — translate with one revision's binary, then run a fixed
-  search binary with lama-first; one shared 30 min / 8 GiB budget, per-phase
-  `/usr/bin/time`, and the end-to-end wall time for agile scores.
+  search binary with lama-first; one shared budget (optional argument,
+  default 30 min) under 8 GiB, per-phase `/usr/bin/time`, and the
+  end-to-end wall time for agile scores.
 
 ## Experiments
 
@@ -39,7 +40,8 @@ in this directory instead of each carrying its own copy.
   budget.
 - `2026-07-23-G-lama-first-agile.py` — lama-first coverage and IPC agile score
   across four translator generations: Python, the initial C++ port, Jendrik's
-  revised C++ translator, and the modernize-translator tip.
+  revised C++ translator, and the modernize-translator tip; agile-track
+  budget (300 s, 8192 MiB).
 
 ## Running
 
