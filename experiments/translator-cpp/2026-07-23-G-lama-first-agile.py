@@ -151,9 +151,12 @@ def build_python_translator(sha):
         check=True, stdout=subprocess.PIPE,
     )
     subprocess.run(["tar", "-x", "-C", str(src)], input=archive.stdout, check=True)
+    # Mirror the driver: the translator is the package *translate*, run as
+    # "python3 -m translate" with the package's parent dir on PYTHONPATH.
     shim.write_text(
         "#!/bin/bash\n"
-        f'exec python3 "{src}/translate.py" "$@"\n'
+        f'export PYTHONPATH="{cache}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+        "exec python3 -m translate \"$@\"\n"
     )
     shim.chmod(0o755)
     return str(shim)
